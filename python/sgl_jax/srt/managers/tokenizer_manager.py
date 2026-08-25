@@ -137,7 +137,7 @@ class TokenizerManager:
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
-        self.recv_from_detokenizer = get_zmq_socket(
+        self.recv_from_detokenizer = get_zmq_socket(    # 从detokenizer接收token解码的结果
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
 
@@ -182,7 +182,7 @@ class TokenizerManager:
 
         # Store states
         self.no_create_loop = False
-        self.rid_to_state: dict[str, ReqState] = {}
+        self.rid_to_state: dict[str, ReqState] = {}  # map，记录每个请求的state，key是rid
         self.health_check_failed = False
         self.gracefully_exit = False
         self.last_receive_tstamp = 0
@@ -282,12 +282,12 @@ class TokenizerManager:
             )
 
         if obj.is_single:
-            tokenized_obj = await self._tokenize_one_request(obj)
-            state = self._send_one_request(obj, tokenized_obj, created_time)
+            tokenized_obj = await self._tokenize_one_request(obj)   # [2] 分词 + 打点
+            state = self._send_one_request(obj, tokenized_obj, created_time)    # [3] 发往调度器
             async for response in self._wait_one_response(obj, state, request):
                 yield response
         else:
-            async for response in self._handle_batch_request(obj, request, created_time):
+            async for response in self._handle_batch_request(obj, request, created_time):   # [2] 分词 + 打点
                 yield response
 
     async def _tokenize_one_request(
@@ -525,7 +525,7 @@ class TokenizerManager:
         )
         # Handle rid being a list (single element) or string
         rid_key = obj.rid[0] if isinstance(obj.rid, list) else obj.rid
-        self.rid_to_state[rid_key] = state
+        self.rid_to_state[rid_key] = state  # 按 rid 查表
         return state
 
     def _notify_state_event(self, state: ReqState) -> None:
@@ -637,7 +637,7 @@ class TokenizerManager:
 
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time) # [3] 发往调度器
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
             else:
@@ -1041,10 +1041,10 @@ class TokenizerManager:
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
-    async def handle_loop(self):
+    async def handle_loop(self):    # [16] 收取Detokenizer发回的已解码的生成的下一个词
         """The event loop that handles requests"""
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj = await self.recv_from_detokenizer.recv_pyobj() # 从detokenizer接收token解码的结果
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.perf_counter()
 
@@ -1142,7 +1142,7 @@ class TokenizerManager:
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
                 state.finished_time = time.time()
-                meta_info["e2e_latency"] = state.finished_time - state.created_time
+                meta_info["e2e_latency"] = state.finished_time - state.created_time # 服务端计算 e2e_latency
                 # Release LoRA ID if it was acquired
                 # Note: Only GenerateReqInput supports LoRA, not EmbeddingReqInput
                 if (
@@ -1321,7 +1321,7 @@ class TokenizerManager:
             self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
-        state = self.rid_to_state[recv_obj.rid]
+        state = self.rid_to_state[recv_obj.rid]     # 按 rid 查表
         state.finished = True
         state.out_list.append(
             {
@@ -1337,7 +1337,7 @@ class TokenizerManager:
                 },
             }
         )
-        state.event.set()
+        state.event.set()   # → http_server.py 协程醒来 yield SSE chunk
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(

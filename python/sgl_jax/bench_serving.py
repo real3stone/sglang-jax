@@ -1938,7 +1938,7 @@ async def get_request(
             # The next request will be sent after the interval.
             await asyncio.sleep(interval)
 
-
+# 客户端 从 SSE 时间戳算: TTFT / TPOT / ITL 等metric信息
 def calculate_metrics(
     input_requests: list[DatasetRow] | None,
     outputs: list[RequestFuncOutput],

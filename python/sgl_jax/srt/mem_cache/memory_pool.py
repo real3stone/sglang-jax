@@ -775,7 +775,7 @@ class SWAKVPool(KVCache):
         page_size: int,
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
-        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        token_to_kv_pool_class: KVCache = MHATokenToKVPool, # [11] KV 池, donate buffer，原地写
         swa_head_num: int | None = None,
         swa_head_dim: int | None = None,
         **kwargs,

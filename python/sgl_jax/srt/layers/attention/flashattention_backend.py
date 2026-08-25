@@ -712,7 +712,7 @@ class FlashAttention(AttentionBackend):
             )
 
             # Call fused KV kernel with head interleaving
-            result, updated_kv_cache_fused = ragged_paged_attention_v3(
+            result, updated_kv_cache_fused = ragged_paged_attention_v3( # [10] Attention + KV
                 queries,
                 keys,
                 values,

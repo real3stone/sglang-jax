@@ -427,7 +427,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, s_state)
             rng_key = jax.random.fold_in(base_rng_key, rng_step)
-            next_ids, token_logprobs, _new_output = sampler(
+            next_ids, token_logprobs, _new_output = sampler(    # [12] 采样, JIT内（单独的一个JIT模块）
                 output,
                 sampling_metadata,
                 use_sort_for_toppk_minp=use_sort_for_toppk_minp,
@@ -857,7 +857,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
         with jax.profiler.TraceAnnotation("_forward_raw"):
-            ret = self._forward_raw(forward_batch, logits_metadata)
+            ret = self._forward_raw(forward_batch, logits_metadata) # 这里 进去 XLA kernel
         return ret
 
     def _forward_raw(

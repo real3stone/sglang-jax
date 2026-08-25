@@ -61,7 +61,7 @@ class DetokenizerManager:
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
-        self.send_to_tokenizer = get_zmq_socket(
+        self.send_to_tokenizer = get_zmq_socket(    # 跨进程, 发回tokenizer
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
 
@@ -91,12 +91,12 @@ class DetokenizerManager:
             ]
         )
 
-    def event_loop(self):
+    def event_loop(self):   # [14] ZMQ PULL，解码，然后 PUSH
         """The event loop that handles requests"""
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
-            output = self._request_dispatcher(recv_obj)
-            self.send_to_tokenizer.send_pyobj(output)
+            output = self._request_dispatcher(recv_obj) # 解码/去分词
+            self.send_to_tokenizer.send_pyobj(output)   # [15] 发回给 tokenizer
 
     def trim_matched_stop(self, output: str | list[int], finished_reason: dict, no_stop_trim: bool):
         if no_stop_trim or not finished_reason:
@@ -249,7 +249,7 @@ class DetokenizerManager:
             new_token_ids = read_ids[i][len(surr_ids[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
-                if len(new_text) > 0 and not new_text.endswith("�"):
+                if len(new_text) > 0 and not new_text.endswith("�"): # 增量解码偏移：攒到能构成合法 UTF-8 才吐
                     s.decoded_text = s.decoded_text + new_text
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)

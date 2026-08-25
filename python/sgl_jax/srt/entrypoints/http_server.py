@@ -281,12 +281,12 @@ async def set_internal_state(obj: SetInternalStateReq, request: Request):
 
 # fastapi implicitly converts json in the request to obj (dataclass)
 @app.api_route("/generate", methods=["POST", "PUT"])
-async def generate_request(obj: GenerateReqInput, request: Request):
+async def generate_request(obj: GenerateReqInput, request: Request):    # [1] HTTP 入口
     """Handle a generate request."""
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
-            try:
+            try:    # `await state.event`（`asyncio.Event`），醒来吐一个 SSE chunk，清 event 继续等
                 async for out in _global_state.tokenizer_manager.generate_request(obj, request):
                     yield (b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n")
             except ValueError as e:
@@ -301,7 +301,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             background=_global_state.tokenizer_manager.create_abort_task(obj),
         )
     else:
-        try:
+        try:    # 等待 tokenizer_manager 唤醒这个线程，拿到结果
             ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
             return ret
         except ValueError as e:

@@ -209,7 +209,7 @@ class Req:
         self.mm_inputs: dict | None = None
 
         # Each decode stage's output ids
-        self.output_ids = []
+        self.output_ids = []            # 已生成的 token 留在 output_ids（即使被抢占踢回wait队列）
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
 

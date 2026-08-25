@@ -272,12 +272,12 @@ class Scheduler(
 
                 if server_args.skip_tokenizer_init:
                     # Directly send to the TokenizerManager
-                    self.send_to_detokenizer = get_zmq_socket(
+                    self.send_to_detokenizer = get_zmq_socket(  # 跨进程
                         context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                     )
                 else:
                     # Send to the DetokenizerManager
-                    self.send_to_detokenizer = get_zmq_socket(
+                    self.send_to_detokenizer = get_zmq_socket(  # 跨进程
                         context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                     )
 
@@ -511,7 +511,7 @@ class Scheduler(
             self.tree_cache,
         )
         assert server_args.schedule_conservativeness >= 0, "Invalid schedule_conservativeness"
-        self.init_new_token_ratio = min(
+        self.init_new_token_ratio = min( # new_token_ratio 控制 prefill 进批的程度
             global_config.default_init_new_token_ratio * server_args.schedule_conservativeness,
             1.0,
         )
@@ -1071,13 +1071,13 @@ class Scheduler(
         self.pending_dp_reqs = result.pending_reqs
         return result.ready_reqs
 
-    def event_loop_normal(self):
+    def event_loop_normal(self):    # [4/5]事件循环 + 收请求
         """A normal scheduler loop."""
         while True:
-            recv_reqs = (
+            recv_reqs = (   # 1、新到的请求收进等待队列，ZMQ PULL，非阻塞轮询
                 self._comm_backend.recv_requests()
                 if self._comm_backend is not None
-                else self.recv_requests()
+                else self.recv_requests()  # 从 ZMQ pull新请求（Tokenizer Push进去的）
             )
             # Assign DP rank to incoming requests
             recv_reqs = self.select_dp_for_request(recv_reqs)
@@ -1088,15 +1088,15 @@ class Scheduler(
                 continue
 
             _it1 = time.perf_counter() if self.pd == "pathways" else 0.0
-            batch = self.get_next_batch_to_run()
+            batch = self.get_next_batch_to_run()    # [6] 组批，内存态 ｜ 决策：「这一步跑哪些请求」（跑 prefill 批、decode 批还是混合）
             self.cur_batch = batch
             self._flush_pending_h2d()
             _it2 = time.perf_counter() if self.pd == "pathways" else 0.0
 
             if batch:
-                result = self.run_batch(batch)
+                result = self.run_batch(batch)      # [7] 跑批, JAX 异步 dispatch
                 _it3 = time.perf_counter() if self.pd == "pathways" else 0.0
-                self.process_batch_result(batch, result)
+                self.process_batch_result(batch, result) # [13] 获取采样结果，ZMQ PUSH，Scheduler -> Detokenizer ｜处理batch结果，每个请求各自前进一个 token，完成的请求踢出running队列
                 if (
                     self.pd == "pathways"
                     and os.environ.get("SGLANG_PD_DBG")
@@ -2058,11 +2058,11 @@ class Scheduler(
         # to bound Max ITL by ~prefill_chunk_time instead of letting a burst of
         # waiting prefills starve running decodes (observed 110s spike at c64).
         df = getattr(self, "_decode_first_n", None)
-        if df is None:
+        if df is None:  # SGL_DECODE_FIRST_INTERLEAVE 控制 prefill 和 decode 的比例，
             df = int(os.environ.get("SGL_DECODE_FIRST_INTERLEAVE", "0"))
             self._decode_first_n = df
             self._consec_decode = 0
-        skip_prefill = (
+        skip_prefill = ( # 当已经连续跑了N个 Prefill 批次，调度器就会跳过 prefill 队列
             df > 0
             and not self.running_batch.is_empty()
             and not self.running_batch.is_prefill_only
@@ -2087,7 +2087,7 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not self.running_batch.is_empty() and not self.running_batch.is_prefill_only:
-                self.running_batch = self.update_running_batch(self.running_batch)
+                self.running_batch = self.update_running_batch(self.running_batch)  # 组装batch：把张量/索引准备好
                 ret = self.running_batch if not self.running_batch.is_empty() else None
                 if ret is not None:
                     self._consec_decode += 1
@@ -2317,7 +2317,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
         )
 
-        new_batch.prepare_for_extend()
+        new_batch.prepare_for_extend()  # 把张量/索引准备好
 
         # Mixed-style chunked prefill
         if (
@@ -2384,7 +2384,7 @@ class Scheduler(
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_ratio = self.new_token_ratio
-
+                                                            # 显存不够时，decode请求被抢占，对应KV释放（ratio控制比例）
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(self.server_args)
             num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
@@ -2433,7 +2433,7 @@ class Scheduler(
             return batch
 
         # Update batch arrays
-        batch.prepare_for_decode()
+        batch.prepare_for_decode() # 把张量/索引准备好
         return batch
 
     def _extract_dp_output_ids(
@@ -2479,7 +2479,7 @@ class Scheduler(
             precompile_cache_loc_paddings,
         ) = _worker.get_precompile_paddings()
         if self.spec_algorithm is None or self.spec_algorithm.is_none():
-            model_worker_batch = batch.get_model_worker_batch(
+            model_worker_batch = batch.get_model_worker_batch(  # 真实长度 → 桶长度
                 precompile_token_paddings,
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
@@ -2493,7 +2493,7 @@ class Scheduler(
                 ):
 
                     logits_output, next_token_ids, cache_miss_count = (
-                        self.tp_worker.forward_batch_generation(
+                        self.tp_worker.forward_batch_generation(    # [8] Worker, padding 到桶 在这里
                             model_worker_batch, sampling_metadata=None
                         )
                     )

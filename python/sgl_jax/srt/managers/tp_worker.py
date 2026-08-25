@@ -526,7 +526,7 @@ class ModelWorker:
             if future_map is not None:
                 return (logits_output, next_token_ids_device, cache_miss_count, new_future_map)
             return (logits_output, next_token_ids_device, cache_miss_count)
-
+        # [9] 模型前向, JIT 边界
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=logits_metadata,

@@ -280,8 +280,8 @@ def get_vmem_estimate_bytes(
     # in f32, with ~4x overhead for softmax temps, pipelining, and spills.
     # Use bkv_csz (compute size) since that determines the matmul tile size.
     compute_bkv = bkv_csz if bkv_csz is not None else bkv_sz
-    compute_bits = (
-        actual_num_kv_heads
+    compute_bits = (         # `bq_sz / bkv_sz` 是 DMA 搬运块大小——一次从 HBM 搬进 VMEM 的粒度
+        actual_num_kv_heads  # `bq_csz / bkv_csz` 是compute 子块——数据进 VMEM 后再切、喂给 MXU 的粒度，决定 matmul tile 与 VMEM 中间量
         * bq_sz
         * num_q_heads_per_kv_head
         * (compute_bkv + head_dim)
@@ -414,7 +414,7 @@ def _ragged_paged_attention_kernel_loop(
     bkv_p = bkv_sz // page_size
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
 
-    q_start = cu_q_lens_ref[seq_idx]
+    q_start = cu_q_lens_ref[seq_idx] # cu_q_lens（Query 长度前缀和，用于切分拼接好的多个Query序列）
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
@@ -504,7 +504,7 @@ def _ragged_paged_attention_kernel_loop(
         if use_causal_mask:
             assert not skip_kv_mask
             mask = mask_and(mask, q_span >= k_span)
-        elif custom_mask_data is not None:
+        elif custom_mask_data is not None:          # ← elif，互斥
             # custom_mask_data: [actual_bq_csz, bkv_csz] int32, 1=keep
             custom_mask_expanded = jnp.repeat(custom_mask_data, num_q_heads_per_kv_head, axis=0)
             mask = mask_and(mask, custom_mask_expanded == 1)
@@ -639,11 +639,11 @@ def _ragged_paged_attention_kernel_loop(
         if not wait:
             # Make sure the current bkv buffer is safe to overwrite.
             wait_update_kv_cache(bkv_sem_idx)
-
-            for i in range(bkv_p):
-                sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
-                page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
-                _async_copy(
+                                    # clip(value, min, max)：把计算结果强制限制在min和max之间；kv_left_frm_cache：这条序列总共需要搬运到内存的 Token 数量
+            for i in range(bkv_p):  # bkv_p：每个TPU核心分到的Tile中包含多少页，page_size：每一页的最大容量
+                sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)          # 相减部分的含义：i * page_size 代表前面的 i 页已经“装满”了多少个 Token。
+                page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)   # 用总数减去它，得到的就是留给当前页及之后所有页的剩余 Token 数量
+                _async_copy(    # 告诉硬件去搬运 sz 大小的数据                              # 因此，sz可能为0，表示DMA搬运0(因为是静态编译，所以通过这种方式相当于跳过了搬运)
                     cache_hbm_ref.at[pl.ds(page_indices_ref[page_idx] * page_size, sz)],
                     vmem_ref.at[pl.ds(i * page_size, sz)],
                     sem,
@@ -879,7 +879,7 @@ def _ragged_paged_attention_kernel_loop(
     def process(static_q_len=None):
         if static_q_len is None:
             actual_bq_sz = bq_sz
-            num_bq = cdiv(q_len, actual_bq_sz)
+            num_bq = cdiv(q_len, actual_bq_sz) # 计算num_bq
         else:
             actual_bq_sz = min(bq_sz, static_q_len)
             num_bq = cdiv(static_q_len, actual_bq_sz)
@@ -917,7 +917,7 @@ def _ragged_paged_attention_kernel_loop(
         def compute_with_bq(bq_idx):
             acc_ref[...] = jnp.full_like(acc_ref, 0.0)
 
-            # Initialize l, m before bkv loop.
+            # Initialize l, m before bkv loop. # W6-05 三状态(acc_ref/m_ref/l_ref)，初始化在 bkv 循环之外
             if attention_sink_ref is not None:
                 # Attention sink: m = sink logits, l = 1.0
                 # (pretend we've already seen a virtual token with logit = sink_value).
@@ -939,16 +939,16 @@ def _ragged_paged_attention_kernel_loop(
             next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
                 seq_idx, bq_idx, bq_sem_idx
             )
-
+            # kv_q_gap = kv_len − q_len，即 cache 中已存前缀的长度, W6-08 的 prefix gap
             processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
             start_bkv_idx = 0
             if sliding_window is not None:
                 start_bkv_idx = jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
-            if use_causal_mask:
+            if use_causal_mask: # causal 收紧，取最小值
                 effective_kv_len = jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
             else:
                 effective_kv_len = kv_len
-            end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
+            end_bkv_idx = cdiv(effective_kv_len, bkv_sz) # W6-08 的「跳块」，只读取需要用到的KV块
 
             # xai temperature computation
             xai_temperature_reg = None
@@ -966,7 +966,7 @@ def _ragged_paged_attention_kernel_loop(
                     absolute_q_position > xai_temperature_len, _qtemp, 1.0
                 )
 
-            # Prefetch next bq
+            # Prefetch next bq （双缓冲，先触发第一块的DMA获取）
             @pl.when(next_seq_idx < end_seq_idx)
             def prefetch_next_bq():
                 sem_ids_ref[0] = next_bq_sem_idx
@@ -983,15 +983,15 @@ def _ragged_paged_attention_kernel_loop(
                 )
                 processed_kv_len = bkv_idx * bkv_sz
 
-                # Prefetch next bkv
+                # Prefetch next bkv （双缓冲，先触发下一块的DMA获取）（非阻塞）
                 @pl.when(next_seq_idx < end_seq_idx)
                 def prefetch_next_bkv():
                     sem_ids_ref[1] = next_bkv_sem_idx
-                    start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
+                    start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx) # DMA 搬运指令
                     if custom_mask_ref is not None:
                         start_fetch_mask(next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx)
 
-                # Wait for cur bq if not ready yet
+                # Wait for cur bq if not ready yet（双缓冲，等待当前块的DMA获取）（阻塞）
                 @pl.when(bkv_idx == start_bkv_idx)
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
@@ -1004,7 +1004,7 @@ def _ragged_paged_attention_kernel_loop(
                     wait_fetch_mask(seq_idx, bq_idx, bkv_idx, bkv_sem_idx)
 
                 # Start updating bkv to kv cache if applicable.
-                # Only needed in last bq loop.
+                # Only needed in last bq loop.  KV cache 就地更新（仅最后一个 bq 迭代）
                 @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
                 def update_cur_bkv_to_cache():
                     start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
@@ -1023,15 +1023,15 @@ def _ragged_paged_attention_kernel_loop(
 
                 # Use static loop bound to avoid potential Pallas issues with
                 # dynamic loop bounds. The @pl.when guard skips invalid iterations.
-                max_num_loops = bkv_sz // bkv_csz
+                max_num_loops = bkv_sz // bkv_csz  # `bq_sz / bkv_sz`是 DMA 搬运块, 按 csz 切 compute 子块
 
                 @pl.loop(0, max_num_loops, unroll=False)
-                def attention_loop(idx):
+                def attention_loop(idx): # 每个compute 子块的 attention计算
                     bkv_start = idx * bkv_csz
 
                     @pl.when(bkv_start < effective_bkv_sz)
                     def _():
-                        for bq_start in range(0, actual_bq_sz, actual_bq_csz):
+                        for bq_start in range(0, actual_bq_sz, actual_bq_csz): # 按照actual_bq_csz这个步长获取bq
                             # Slice custom mask for this compute sub-block
                             cur_mask_data = None
                             if custom_mask_data is not None:
@@ -1116,9 +1116,9 @@ def _ragged_paged_attention_kernel_loop(
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
     ### ------- Kernel start ------- ###
-
+    # 这就是 W6-10 手写的那个 schedule —— 初始灌一块、主体循环、收尾排空，三段一模一样
     @pl.when(seq_idx == start_seq_idx)
-    def prologue():
+    def prologue():                 # 灌流水线：预取第一块 bq 和 bkv
         start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
         # Initialize bkv_x2_ref to zeros to avoid NaN issues.
         # Use bitcast to int32 and preserve actual shape (which may include bank conflict padding)
@@ -1135,7 +1135,7 @@ def _ragged_paged_attention_kernel_loop(
         process(static_q_len=static_q_len)
 
     @pl.when(seq_idx == end_seq_idx - 1)
-    def epilogue():
+    def epilogue():                 # 排空：等所有 DMA 落地
         for i in range(2):
             wait_send_bo(bo_sem_idx=i)
             wait_update_kv_cache(bkv_sem_idx=i)
@@ -1661,7 +1661,7 @@ def get_vmem_limit():
         "disable_semaphore_checks",
         "debug_mode",
         "mask_aligned_to_cu_kv",
-    ),
+    ), # 告诉编译器“这些输入不再使用了”，可以直接覆盖
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
 def ragged_paged_attention(
@@ -1825,8 +1825,8 @@ def ragged_paged_attention(
         bkv_csz,
         static_q_len=None,
         case: RpaCase = RpaCase.MIXED,
-    ):
-        in_specs = [
+    ):               # 只写 `memory_space=HBM`、不写 `block_shape`/`index_map` = "别切块别搬，把 HBM 地址给我"
+        in_specs = [ # → 即：关掉自动流水线的开关。kernel 里的 `q_hbm_ref` 是整张数组的 HBM 引用，不是 VMEM 窗口。
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # kv
             pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache
@@ -1836,20 +1836,20 @@ def ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),  # zero_mask
             (
                 pl.BlockSpec(memory_space=pltpu.VMEM) if attention_sink is not None else None
-            ),  # attention_sink
+            ),  # attention_sink 用 VMEM
         ]
 
-        out_specs = [
+        out_specs = [ # kernel 的输出是一个包含两个元素的元组：输出 0：output（最终的 Attention 结果），输出 1：updated_kv_cache_fused（更新后的 Cache）
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
         ]
 
-        bkv_stride = num_kv_heads_x2_per_kv_packing
-        if has_bank_conflicts(bkv_stride):
+        bkv_stride = num_kv_heads_x2_per_kv_packing # `bkv_stride` 是 KV 交错通道维的长度（`num_kv_heads_x2 // kv_packing`）
+        if has_bank_conflicts(bkv_stride):          #  有 bank 冲突时 +1
             bkv_stride += 1
 
         bkv_double_buf = pltpu.VMEM(
-            (2, bkv_sz, bkv_stride, *kv_cache.shape[3:]),
+            (2, bkv_sz, bkv_stride, *kv_cache.shape[3:]), # 第一维那个 2 就是双缓冲
             kv_cache.dtype,
         )
 
@@ -1949,8 +1949,8 @@ def ragged_paged_attention(
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
-                out_specs=out_specs,
-                grid=(1,),
+                out_specs=out_specs, # 这里看到输出的序号0和1。
+                grid=(1,), # 等于告诉 Pallas「别管我，循环我自己在 kernel 里写」
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
@@ -1969,11 +1969,11 @@ def ragged_paged_attention(
                     jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
                     jax.ShapeDtypeStruct(shape=kv_cache.shape, dtype=kv_cache.dtype),
                 ]
-            ),
+            ), # “指挥”编译器复用底层的物理内存。配合 donate_argnames 告诉编译器“这些输入不再使用了”，就成功省下了一次极其昂贵的 HBM 申请和全量拷贝操作
             input_output_aliases={
-                9: 0,  # q -> output
+                9: 0,  # q -> output  # 让第 0 号输出（最终的 Attention 结果），直接复用第 9 号输入（q 张量）的物理内存
                 11: 1,  # kv_cache -> updated_kv_cache
-            },
+            }, # 让第 1 号输出（更新后的 KV Cache），直接复用第 11 号输入（传入的 kv_cache_fused 张量）的物理内存
             name=scope_name,
         )
 
@@ -2000,11 +2000,11 @@ def ragged_paged_attention(
         else:
 
             def run(scalar_prefetches, q, kv, kv_cache):
-                return kernel(
+                return kernel( # 这里是真正的调用kernel，可以对应到输入的序号9和序号11。
                     *scalar_prefetches,
-                    q,
-                    kv,
-                    kv_cache,
+                    q,              # Query 张量
+                    kv,             # 当前步新计算的 KV 张量
+                    kv_cache,       # 整个庞大的 Paged KV Cache
                     custom_mask,
                     zero_mask,
                     attention_sink,
