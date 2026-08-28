@@ -32,6 +32,28 @@ class TestFlashAttentionMisc(AttentionTestBase):
             logit_cap=logit_cap,
         )
 
+    def test_sliding_window_narrower_than_sequence_prefill_accuracy(self):
+        """Sliding window that actually cuts inside a multi-row query tile.
+
+        The companion test above uses a 512-token window against sequences of
+        at most 400, so its window predicate is uniformly true and would pass
+        even if the sliding-window arm were dropped entirely. Here the window
+        is narrower than every sequence, so the boundary key tile is genuinely
+        split. GQA (32 q / 8 kv) also makes the query row index a floor-divide
+        rather than a plain iota.
+        """
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [(512, 512), (256, 256), (130, 130)]
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 16, jnp.bfloat16),
+            sliding_window=128,
+        )
+
     def test_sliding_window_and_soft_cap_decode_accuracy(self):
         """Test combined sliding window and soft cap attention accuracy in decode mode"""
         # Parameters
