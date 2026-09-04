@@ -42,6 +42,7 @@ import argparse
 import functools
 import statistics
 import sys
+import types
 
 # Run from the repo root. On a bare clone sgl_jax lives under python/ and the
 # benchmark package sits at the top level, so put both on the path rather than
@@ -202,6 +203,17 @@ def bench_tree_kernels() -> dict[str, float]:
     Fixed shapes, so this is a magnitude, not a curve. Chain drafting runs none
     of them, so whatever they cost is pure tree overhead per iteration.
     """
+    # bench_speculative_kernels imports CustomTestCase/is_in_ci for a test class
+    # it also defines; that import pulls in flax, and some hosted TPU images ship
+    # a flax newer than their jax (ImportError on jax._src.core.mutable_array).
+    # The three benchmark functions need neither name, so stub the module rather
+    # than require a working flax to time three Pallas kernels.
+    if "sgl_jax.test.test_utils" not in sys.modules:
+        stub = types.ModuleType("sgl_jax.test.test_utils")
+        stub.CustomTestCase = object
+        stub.is_in_ci = lambda: False
+        sys.modules["sgl_jax.test.test_utils"] = stub
+
     from benchmark.kernels.speculative import bench_speculative_kernels as bsk
 
     out = {}
@@ -241,7 +253,7 @@ def main() -> None:
     ap.add_argument("--kv-heads", type=int, default=8)
     ap.add_argument("--head-dim", type=int, default=128)
     ap.add_argument("--page-size", type=int, default=128)
-    ap.add_argument("--tries", type=int, default=7)
+    ap.add_argument("--tries", type=int, default=15)
     args = ap.parse_args()
 
     check_env()
@@ -271,6 +283,22 @@ def main() -> None:
         f"{chain_ms:8.4f} ms   <- baseline"
     )
 
+    # Measure the baseline a second time. Any spread is pure run-to-run noise,
+    # and it sets the bar for how large a ratio has to be to mean anything. This
+    # is a designed probe, not a spare number: on a first run the same config
+    # timed twice differed by 8%, which is larger than most of the ratios below.
+    chain_ms2 = bench_verify(
+        draft_token_num=args.chain_draft_tokens, with_mask=False, **common
+    )
+    noise = abs(chain_ms2 - chain_ms) / ((chain_ms + chain_ms2) / 2)
+    print(
+        f"  chain  q={args.chain_draft_tokens:<3} repeat              "
+        f"{chain_ms2:8.4f} ms   noise floor {noise * 100:.1f}%"
+    )
+    if noise > 0.03:
+        print("         ^ raise --tries; ratios below this are not measurements")
+    print()
+
     tree_rows = []
     for n in args.tree_draft_tokens:
         try:
@@ -279,7 +307,12 @@ def main() -> None:
             print(f"  tree   q={n:<3} FAILED: {type(exc).__name__}: {exc}")
             continue
         tree_rows.append((n, ms))
-        print(f"  tree   q={n:<3} tree mask, causal=0 {ms:8.4f} ms   {ms / chain_ms:6.2f}x chain")
+        ratio = ms / chain_ms
+        verdict = "within noise" if abs(ratio - 1.0) <= noise else ""
+        print(
+            f"  tree   q={n:<3} tree mask, causal=0 {ms:8.4f} ms   "
+            f"{ratio:6.2f}x chain  {verdict}"
+        )
 
     # Same q, mask on/off: how much of the tree's verify cost is the mask itself
     # rather than the extra rows. Not production-shaped, but it says whether the
@@ -317,7 +350,8 @@ def main() -> None:
     print(f"  {'tree q':>8}  {'verify ms':>11}  {'cost ratio':>11}  {'tau_tree must reach':>21}")
     for n, ms in tree_rows:
         ratio = ms / chain_ms
-        print(f"  {n:>8}  {ms:>11.4f}  {ratio:>10.2f}x  {'tau_chain x %.2f' % ratio:>21}")
+        need = "no gain needed" if abs(ratio - 1.0) <= noise else "tau_chain x %.2f" % ratio
+        print(f"  {n:>8}  {ms:>11.4f}  {ratio:>10.2f}x  {need:>21}")
     print()
     print("  Verify attention only. This is a LOWER bound on the cost ratio -- everything")
     print("  omitted works against the tree:")
