@@ -283,20 +283,6 @@ def main() -> None:
         f"{chain_ms:8.4f} ms   <- baseline"
     )
 
-    # Measure the baseline a second time. Any spread is pure run-to-run noise,
-    # and it sets the bar for how large a ratio has to be to mean anything. This
-    # is a designed probe, not a spare number: on a first run the same config
-    # timed twice differed by 8%, which is larger than most of the ratios below.
-    chain_ms2 = bench_verify(
-        draft_token_num=args.chain_draft_tokens, with_mask=False, **common
-    )
-    noise = abs(chain_ms2 - chain_ms) / ((chain_ms + chain_ms2) / 2)
-    print(
-        f"  chain  q={args.chain_draft_tokens:<3} repeat              "
-        f"{chain_ms2:8.4f} ms   noise floor {noise * 100:.1f}%"
-    )
-    if noise > 0.03:
-        print("         ^ raise --tries; ratios below this are not measurements")
     print()
 
     tree_rows = []
@@ -307,11 +293,9 @@ def main() -> None:
             print(f"  tree   q={n:<3} FAILED: {type(exc).__name__}: {exc}")
             continue
         tree_rows.append((n, ms))
-        ratio = ms / chain_ms
-        verdict = "within noise" if abs(ratio - 1.0) <= noise else ""
         print(
             f"  tree   q={n:<3} tree mask, causal=0 {ms:8.4f} ms   "
-            f"{ratio:6.2f}x chain  {verdict}"
+            f"{ms / chain_ms:6.2f}x chain"
         )
 
     # Same q, mask on/off: how much of the tree's verify cost is the mask itself
@@ -326,6 +310,23 @@ def main() -> None:
             print(f"    q={n:<3} nomask {a:8.4f} ms | mask {b:8.4f} ms | mask costs {b / a:5.2f}x")
         except Exception as exc:
             print(f"    q={n:<3} FAILED: {type(exc).__name__}: {exc}")
+
+    # Re-measure the baseline LAST, so the spread brackets the whole section.
+    # Repeating it back to back measures instantaneous repeatability, which on a
+    # first run reported 1.4% while the same configuration timed in two
+    # different sections differed by 11% -- the cross-section spread is the one
+    # that decides whether a ratio between sections means anything.
+    chain_ms2 = bench_verify(
+        draft_token_num=args.chain_draft_tokens, with_mask=False, **common
+    )
+    noise = abs(chain_ms2 - chain_ms) / ((chain_ms + chain_ms2) / 2)
+    print()
+    print(
+        f"  chain  q={args.chain_draft_tokens:<3} re-measured last    "
+        f"{chain_ms2:8.4f} ms   spread over section A: {noise * 100:.1f}%"
+    )
+    print("  Ratios closer to 1.00 than that are not measurements. The isolation")
+    print("  pairs above are timed adjacently and are tighter than this bound.")
 
     print()
     print("=" * 72)
