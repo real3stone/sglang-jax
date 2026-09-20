@@ -598,6 +598,8 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     get_video_feature = Qwen3VLForConditionalGeneration.get_video_feature
     _get_visual_feature = Qwen3VLForConditionalGeneration._get_visual_feature
 
+    causal_lm_class = None  # bound after Qwen3_5MoeForCausalLM is defined
+
     def get_multimodal_embedding_packed_capacities(self):
         if self.visual is None:
             return ()
@@ -626,7 +628,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         self.dtype = dtype
 
         # The runner merges visual features before the language-model forward.
-        self.language_model = Qwen3_5MoeForCausalLM(config, mesh, dtype=dtype)
+        self.language_model = self.causal_lm_class(config, mesh, dtype=dtype)
         if config.vision_config is not None:
             encoder_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
             self.visual = Qwen3VLVisionModel(
@@ -759,6 +761,11 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         block.experts.w1.value = self._put(w1, (("data", "tensor"), None, None))
         block.experts.w3.value = self._put(w3, (("data", "tensor"), None, None))
 
+    def _weight_mappings(self, hf_config):
+        """``(mappings, visual_skip_patterns, mtp_skip_patterns)`` for this
+        checkpoint layout."""
+        return _create_qwen3_5_weight_mappings(hf_config)
+
     def load_weights(self, model_config: ModelConfig):
         from sgl_jax.srt.utils.weight_utils import (
             SequentialSafetensorManager,
@@ -771,7 +778,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         gdn_layers = list(tc.linear_layer_ids)
         is_moe = tc.is_moe
 
-        mappings, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(hf_config)
+        mappings, visual_skip, mtp_skip = self._weight_mappings(hf_config)
 
         # Keys handled manually (concat / stripe / split) — excluded from the
         # shared loader, which handles every other (simple) weight.
@@ -1062,6 +1069,9 @@ def _create_qwen3_5_weight_mappings(hf_config):
         )
 
     return mappings, _VISUAL_SKIP_PATTERNS, _MTP_SKIP_PATTERNS
+
+
+Qwen3_5MoeForConditionalGeneration.causal_lm_class = Qwen3_5MoeForCausalLM
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
