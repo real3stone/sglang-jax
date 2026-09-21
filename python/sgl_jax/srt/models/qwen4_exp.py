@@ -26,7 +26,7 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.layers.attention.qsa_indexer import QSAIndexer
-from sgl_jax.srt.layers.embeddings import Embed, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import Embed, MRotaryEmbedding, RotaryEmbedding
 from sgl_jax.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -99,14 +99,29 @@ class Qwen4ExpAttention(nnx.Module):
         self.k_norm = GemmaRMSNorm(self.head_dim, epsilon=text_cfg.rms_norm_eps)
 
         rotary_dim = int(self.head_dim * float(text_cfg.partial_rotary_factor))
-        self.rotary_emb = RotaryEmbedding(
-            head_size=self.head_dim,
+        rope_scaling = text_cfg.rope_scaling or {}
+        common = dict(
             rotary_dim=rotary_dim,
             max_position_embeddings=text_cfg.max_position_embeddings,
             base=int(text_cfg.rope_theta),
             is_neox_style=True,
             dtype=dtype,
         )
+        if "mrope_section" in rope_scaling:
+            self.rotary_emb = MRotaryEmbedding(
+                head_size=self.head_dim,
+                mrope_section=rope_scaling["mrope_section"],
+                mrope_interleaved=bool(rope_scaling.get("mrope_interleaved", False)),
+                **common,
+            )
+        else:
+            self.rotary_emb = RotaryEmbedding(head_size=self.head_dim, **common)
+
+        # The indexer rotates only the leading rotary_dim of its own narrower
+        # head, so it takes a rotary sized to that slice. Its positions are
+        # derived from the group index and are scalar by construction, which is
+        # why this one is never the multimodal variant.
+        self.indexer_rotary_emb = RotaryEmbedding(head_size=rotary_dim, **common)
         self.indexer = QSAIndexer(
             hidden_size=self.hidden_size,
             indexer_n_heads=text_cfg.indexer_n_heads,
@@ -135,15 +150,21 @@ class Qwen4ExpAttention(nnx.Module):
             out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
         )
 
-    def _indexer_step(self, hidden_states, positions, forward_batch, token_to_kv_pool):
-        """``None`` when the backend has no compressed cache for this layer."""
+    def _indexer_step(self, hidden_states, forward_batch, token_to_kv_pool):
+        """``None`` when the backend has no compressed cache for this layer.
+
+        Reads ``forward_batch.positions`` rather than whatever the attention
+        was handed: a compressed key is rotated at its group's first position,
+        an index that only exists in the scalar sequence.
+        """
         backend = forward_batch.attn_backend
         slot_map = getattr(backend, "full_slot", None)
         if slot_map is None or self.layer_id not in slot_map:
             return None
         slot = slot_map[self.layer_id]
 
-        indexer_q, raw_key = self.indexer.project(hidden_states, positions, self.rotary_emb)
+        positions = forward_batch.positions
+        indexer_q, raw_key = self.indexer.project(hidden_states, positions, self.indexer_rotary_emb)
         # cu_q_lens comes from the backend's metadata rather than being derived
         # again here, so the compression and the selection agree on the batch.
         compressed, groups, seq_ids, ring = self.indexer.compress_batch(
@@ -152,7 +173,7 @@ class Qwen4ExpAttention(nnx.Module):
             backend.forward_metadata.cu_q_lens,
             forward_batch.req_pool_indices,
             token_to_kv_pool.get_open_group_buffer(slot),
-            self.rotary_emb,
+            self.indexer_rotary_emb,
         )
         return {
             "indexer_q": indexer_q,
@@ -346,7 +367,9 @@ class Qwen4ExpModel(nnx.Module):
         hidden_states = (
             self.embed_tokens(forward_batch.input_ids) if input_embeds is None else input_embeds
         )
-        positions = forward_batch.positions
+        positions = forward_batch.mrope_positions
+        if positions is None:
+            positions = forward_batch.positions
 
         layers_kv_fused = []
         layers_rec_buffers = []

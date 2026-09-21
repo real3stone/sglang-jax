@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import types
 import unittest
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -22,7 +23,9 @@ from flax import nnx
 from jax.sharding import AxisType, Mesh
 
 from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
+from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, RotaryEmbedding
 from sgl_jax.srt.models.qwen4_exp import (
+    Qwen4ExpAttention,
     Qwen4ExpModel,
     _create_qwen4_exp_weight_mappings,
 )
@@ -41,7 +44,12 @@ def _mesh():
     )
 
 
-def _config(*, num_layers=NUM_LAYERS, ple=False):
+# The section widths a real checkpoint ships, scaled to this test's head_dim:
+# they have to sum to rotary_dim // 2.
+MROPE_SECTION = [3, 3, 2]
+
+
+def _config(*, num_layers=NUM_LAYERS, ple=False, mrope=False):
     text = dict(
         num_hidden_layers=num_layers,
         full_attention_interval=INTERVAL,
@@ -63,6 +71,16 @@ def _config(*, num_layers=NUM_LAYERS, ple=False):
     )
     if ple:
         text["ple_layer_ids"] = [PLE_LAYER_1BASED]
+    if mrope:
+        # A real checkpoint nests RoPE under rope_parameters; the config
+        # class flattens it into rope_scaling.
+        text["rope_parameters"] = dict(
+            rope_type="default",
+            mrope_section=MROPE_SECTION,
+            mrope_interleaved=True,
+            rope_theta=10000000,
+            partial_rotary_factor=0.25,
+        )
     return Qwen4ExpConfig(text_config=text)
 
 
@@ -134,6 +152,63 @@ class TestBackboneStructure(CustomTestCase):
         )
         with self.assertRaises(ValueError):
             model.layers[0]._to_streams(jnp.zeros((3, text.hidden_size + 1)))
+
+
+class TestRotary(CustomTestCase):
+    def test_the_attention_follows_the_checkpoint_into_mrope(self):
+        """A checkpoint that ships mrope_section gets the multimodal rotary.
+        Reading only the flat ``rope_scaling`` key says None for both, because
+        the real layout nests under ``rope_parameters``."""
+        mesh = _mesh()
+        with jax.set_mesh(mesh):
+            with_mrope = Qwen4ExpAttention(_config(mrope=True), mesh, layer_id=INTERVAL - 1)
+            without = Qwen4ExpAttention(_config(), mesh, layer_id=INTERVAL - 1)
+
+        self.assertIsInstance(with_mrope.rotary_emb, MRotaryEmbedding)
+        self.assertIsInstance(without.rotary_emb, RotaryEmbedding)
+        self.assertNotIsInstance(without.rotary_emb, MRotaryEmbedding)
+
+    def test_the_indexer_gets_a_rotary_sized_to_its_own_slice(self):
+        """``QSAIndexer`` hands the rotary only the leading rotary_dim of its
+        narrower head, so it needs head_size == rotary_dim -- the attention's
+        own rotary is head_dim wide and would be rejected. The indexer's
+        positions are group indices, so it is never the multimodal variant."""
+        cfg = _config(mrope=True)
+        text = cfg.text_config
+        mesh = _mesh()
+        with jax.set_mesh(mesh):
+            attn = Qwen4ExpAttention(cfg, mesh, layer_id=INTERVAL - 1)
+
+        rotary_dim = int(text.head_dim * float(text.partial_rotary_factor))
+        self.assertEqual(attn.indexer_rotary_emb.head_size, rotary_dim)
+        self.assertNotIsInstance(attn.indexer_rotary_emb, MRotaryEmbedding)
+        self.assertEqual(attn.rotary_emb.head_size, text.head_dim)
+
+        # The mismatch only shows at the call, and only on the path the model
+        # actually takes, so drive _indexer_step and record what it hands over.
+        seen = {}
+
+        def _project(hidden, positions, rotary_emb):
+            seen["rotary"] = rotary_emb
+            return jnp.zeros((4, text.indexer_n_heads, text.indexer_head_dim)), jnp.zeros(
+                (4, text.indexer_head_dim)
+            )
+
+        attn.indexer.project = _project
+        attn.indexer.compress_batch = lambda *a, **k: (None, None, None, None)
+        forward_batch = types.SimpleNamespace(
+            attn_backend=types.SimpleNamespace(
+                full_slot={attn.layer_id: 0},
+                forward_metadata=types.SimpleNamespace(cu_q_lens=jnp.asarray([0, 4], jnp.int32)),
+            ),
+            req_pool_indices=jnp.asarray([0], jnp.int32),
+            positions=jnp.arange(4, dtype=jnp.int32),
+        )
+        pool = types.SimpleNamespace(get_open_group_buffer=lambda slot: None)
+
+        with jax.set_mesh(mesh):
+            attn._indexer_step(jnp.zeros((4, text.hidden_size)), forward_batch, pool)
+        self.assertIs(seen["rotary"], attn.indexer_rotary_emb)
 
 
 class TestWeightMappings(CustomTestCase):
