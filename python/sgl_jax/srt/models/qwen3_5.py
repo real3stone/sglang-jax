@@ -600,6 +600,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     _get_visual_feature = Qwen3VLForConditionalGeneration._get_visual_feature
 
     causal_lm_class = None  # bound after Qwen3_5MoeForCausalLM is defined
+    vision_model_class = Qwen3VLVisionModel
 
     def get_multimodal_encode_funcs(self):
         if self.visual is None:
@@ -621,9 +622,9 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
 
         # The runner merges visual features before the language-model forward.
         self.language_model = self.causal_lm_class(config, mesh, dtype=dtype)
-        if config.vision_config is not None:
+        if config.vision_config is not None and self.vision_model_class is not None:
             encoder_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
-            self.visual = Qwen3VLVisionModel(
+            self.visual = self.vision_model_class(
                 config.vision_config,
                 dtype,
                 mesh=mesh,
