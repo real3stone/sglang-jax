@@ -293,6 +293,17 @@ class TestWeightMappings(CustomTestCase):
             self.assertTrue(target.startswith(prefix), target)
             self.assertIn(target[len(prefix) :], params, f"{target} names no parameter")
 
+    def test_without_the_ngram_layer_its_tensors_are_skipped(self):
+        """With no layer building the N-gram module, its tensors are still in
+        the checkpoint, and the load summary rejects any key it cannot place."""
+        cfg = _config()
+        mappings, visual_skip, mtp_skip = _create_qwen4_exp_weight_mappings(cfg, _mapping_head(cfg))
+        weight_info = dict.fromkeys(mappings, [])
+        weight_info[f"model.language_model.layers.{PLE_LAYER_1BASED - 1}.ple.key_proj.weight"] = []
+        Qwen4ExpForConditionalGeneration._log_load_summary(
+            mappings, weight_info, visual_skip, mtp_skip
+        )
+
     def test_the_absorbed_norms_are_gone_and_no_added_entry_shares_a_target(self):
         """Leaving Qwen3.5's norms in would point at modules that no longer
         exist; an added entry sharing a target would silently load it twice.
