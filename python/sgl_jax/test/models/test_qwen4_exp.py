@@ -27,6 +27,7 @@ from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, RotaryEmbedding
 from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
 from sgl_jax.srt.models.qwen4_exp import (
     Qwen4ExpAttention,
+    Qwen4ExpForConditionalGeneration,
     Qwen4ExpModel,
     _create_qwen4_exp_weight_mappings,
 )
@@ -50,7 +51,7 @@ def _mesh():
 MROPE_SECTION = [3, 3, 2]
 
 
-def _config(*, num_layers=NUM_LAYERS, ple=False, mrope=False):
+def _config(*, num_layers=NUM_LAYERS, ple=False, mrope=False, vision=False):
     text = dict(
         num_hidden_layers=num_layers,
         full_attention_interval=INTERVAL,
@@ -82,7 +83,12 @@ def _config(*, num_layers=NUM_LAYERS, ple=False, mrope=False):
             rope_theta=10000000,
             partial_rotary_factor=0.25,
         )
-    return Qwen4ExpConfig(text_config=text)
+    # The released checkpoint ships a vision sub-config, which the config
+    # class keeps as a plain dict.
+    vision_config = (
+        dict(depth=2, hidden_size=64, num_heads=2, spatial_merge_size=2) if vision else None
+    )
+    return Qwen4ExpConfig(text_config=text, vision_config=vision_config)
 
 
 def _model(cfg, mesh):
@@ -100,6 +106,15 @@ class TestBackboneStructure(CustomTestCase):
         self.assertEqual(full, list(cfg.text_config.full_attention_layer_ids))
         self.assertEqual(len(full), NUM_LAYERS // INTERVAL)
         self.assertTrue(all(layer.ple is None for layer in model.layers))
+
+    def test_a_checkpoint_vision_config_builds_no_tower(self):
+        """Text-only: the vision sub-config is carried along but no tower is
+        built from it, so its weights are skipped."""
+        mesh = _mesh()
+        with jax.set_mesh(mesh):
+            model = Qwen4ExpForConditionalGeneration(_config(vision=True), mesh)
+        self.assertIsNone(model.visual)
+        self.assertEqual(model.get_multimodal_encode_funcs(), {})
 
     @unittest.skipUnless(
         importlib.util.find_spec("sgl_jax.srt.layers.ngram_embedding"),

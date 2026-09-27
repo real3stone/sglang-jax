@@ -429,9 +429,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
     pre-fused experts, same ``model.language_model.*`` rooting -- so everything
     below the backbone is inherited and only the backbone and the mapping table
     are replaced.
+
+    It is text-only: the checkpoint's vision sub-config is carried along, but no
+    tower is built from it, so the vision weights are skipped.
     """
 
     causal_lm_class = Qwen4ExpForCausalLM
+    vision_model_class = None
 
     def _weight_mappings(self, hf_config):
         return _create_qwen4_exp_weight_mappings(hf_config, getattr(self, "lm_head", None))
