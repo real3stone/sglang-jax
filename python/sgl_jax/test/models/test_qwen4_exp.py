@@ -51,7 +51,7 @@ def _mesh():
 MROPE_SECTION = [3, 3, 2]
 
 
-def _config(*, num_layers=NUM_LAYERS, ple=False, mrope=False, vision=False):
+def _config(*, num_layers=NUM_LAYERS, ple=False, mrope=False):
     text = dict(
         num_hidden_layers=num_layers,
         full_attention_interval=INTERVAL,
@@ -83,12 +83,7 @@ def _config(*, num_layers=NUM_LAYERS, ple=False, mrope=False, vision=False):
             rope_theta=10000000,
             partial_rotary_factor=0.25,
         )
-    # The released checkpoint ships a vision sub-config, which the config
-    # class keeps as a plain dict.
-    vision_config = (
-        dict(depth=2, hidden_size=64, num_heads=2, spatial_merge_size=2) if vision else None
-    )
-    return Qwen4ExpConfig(text_config=text, vision_config=vision_config)
+    return Qwen4ExpConfig(text_config=text)
 
 
 def _model(cfg, mesh):
@@ -106,15 +101,6 @@ class TestBackboneStructure(CustomTestCase):
         self.assertEqual(full, list(cfg.text_config.full_attention_layer_ids))
         self.assertEqual(len(full), NUM_LAYERS // INTERVAL)
         self.assertTrue(all(layer.ple is None for layer in model.layers))
-
-    def test_a_checkpoint_vision_config_builds_no_tower(self):
-        """Text-only: the vision sub-config is carried along but no tower is
-        built from it, so its weights are skipped."""
-        mesh = _mesh()
-        with jax.set_mesh(mesh):
-            model = Qwen4ExpForConditionalGeneration(_config(vision=True), mesh)
-        self.assertIsNone(model.visual)
-        self.assertEqual(model.get_multimodal_encode_funcs(), {})
 
     @unittest.skipUnless(
         importlib.util.find_spec("sgl_jax.srt.layers.ngram_embedding"),
@@ -225,6 +211,52 @@ class TestRotary(CustomTestCase):
         with jax.set_mesh(mesh):
             attn._indexer_step(jnp.zeros((4, text.hidden_size)), forward_batch, pool)
         self.assertIs(seen["rotary"], attn.indexer_rotary_emb)
+
+
+# The released config.json, reduced to what differs from Qwen4ExpTextConfig's
+# defaults (which are the released backbone) and matters for construction.
+RELEASED_TEXT = dict(
+    num_experts=512,
+    num_experts_per_tok=10,
+    moe_intermediate_size=640,
+    shared_expert_intermediate_size=640,
+    indexer_budget=2048,
+    indexer_compress_ratio=4,
+    indexer_head_dim=128,
+    indexer_n_heads=4,
+    indexer_kv_heads=1,
+    ple_layer_ids=[2],
+    rope_parameters=dict(
+        rope_type="default",
+        mrope_section=[11, 11, 10],
+        mrope_interleaved=True,
+        rope_theta=10000000,
+        partial_rotary_factor=0.25,
+    ),
+)
+# Carried along as a plain dict and never read: the model is text-only.
+RELEASED_VISION = dict(
+    depth=27, hidden_size=1152, num_heads=16, patch_size=16, spatial_merge_size=2
+)
+
+
+class TestReleasedConfig(CustomTestCase):
+    def test_the_released_config_builds_text_only(self):
+        """The released dimensions reach paths the small configs do not: the
+        vision sub-config, mRoPE, 512 experts at an intermediate size that is
+        not a multiple of 512, and an untied head over the full vocabulary.
+        Built abstractly, so nothing is allocated."""
+        text = dict(RELEASED_TEXT)
+        if not importlib.util.find_spec("sgl_jax.srt.layers.ngram_embedding"):
+            text["ple_layer_ids"] = []  # the N-gram module is not in the tree yet
+        cfg = Qwen4ExpConfig(text_config=text, vision_config=RELEASED_VISION)
+        mesh = _mesh()
+        with jax.set_mesh(mesh):
+            model = nnx.eval_shape(lambda: Qwen4ExpForConditionalGeneration(cfg, mesh))
+
+        self.assertEqual(len(model.language_model.model.layers), 48)
+        self.assertIsNone(model.visual)
+        self.assertEqual(model.get_multimodal_encode_funcs(), {})
 
 
 def _mapping_head(config):
