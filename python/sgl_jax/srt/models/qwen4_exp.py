@@ -522,4 +522,9 @@ def _create_qwen4_exp_weight_mappings(hf_config, lm_head: ParallelLMHead | None 
             use_combine=False,
         )
     )
+
+    if not tc.ple_layer_ids:
+        # No layer builds the N-gram module, but the checkpoint still ships its
+        # tensors. The loader treats both skip lists alike.
+        mtp_skip = [*mtp_skip, r"^model\.language_model\.layers\.\d+\.ple\."]
     return mappings, visual_skip, mtp_skip
