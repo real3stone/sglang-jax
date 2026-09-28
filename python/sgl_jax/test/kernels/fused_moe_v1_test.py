@@ -1123,6 +1123,58 @@ class MoEKernelTest(jtu.JaxTestCase):
         self.assertEqual(eff.bf, 384)
         self.assertEqual(eff.bse, 384)
 
+    def test_effective_for_bd_auto_reduction(self):
+        """bd1/bd2 auto-reduce when hidden_size is not aligned to them.
+
+        Qwen3.8-Flash-Next's hidden_size is 2560 and misses the tuned tables, so
+        the default 1024 tiles would fail validation; 512 is the largest
+        256-aligned tile that divides it."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+        eff = cfg.effective_for(num_tokens=256, ep_size=1, dtype=jnp.bfloat16, hidden_size=2560)
+        self.assertEqual((eff.bd1, eff.bd1c, eff.bd2, eff.bd2c), (512, 512, 512, 512))
+
+    def test_effective_for_bd_no_reduction_when_aligned(self):
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=512,
+            bd2c=1024,
+            bse=512,
+        )
+        eff = cfg.effective_for(num_tokens=256, ep_size=1, dtype=jnp.bfloat16, hidden_size=4096)
+        self.assertEqual((eff.bd1, eff.bd1c, eff.bd2, eff.bd2c), (1024, 512, 1024, 1024))
+
+    def test_effective_for_bd_reduction_shrinks_the_compute_tile(self):
+        """A reduced tile keeps a compute tile that divides it: 1280 does not
+        take 768 or 512, so the compute tile drops to 256."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1536,
+            bd2=1536,
+            btc=32,
+            bfc=512,
+            bd1c=768,
+            bd2c=768,
+            bse=512,
+        )
+        eff = cfg.effective_for(num_tokens=256, ep_size=1, dtype=jnp.bfloat16, hidden_size=2560)
+        self.assertEqual((eff.bd1, eff.bd1c, eff.bd2, eff.bd2c), (1280, 256, 1280, 256))
+
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())
