@@ -168,7 +168,11 @@ class Qwen4ExpAttention(nnx.Module):
         the indexer's rotary is the plain one, and a compressed key is rotated
         at its group's first position, an index only the scalar sequence has.
         """
-        slot_map = getattr(forward_batch.attn_backend, "full_slot", None)
+        # Flash-Next is hybrid, so its backend is the wrapper that routes the
+        # full-attention layers to full_attn_backend.
+        backend = forward_batch.attn_backend
+        backend = getattr(backend, "full_attn_backend", backend)
+        slot_map = getattr(backend, "full_slot", None)
         if slot_map is None or self.layer_id not in slot_map:
             return None
         indexer_q, raw_key = self.indexer.project(
@@ -367,7 +371,11 @@ class Qwen4ExpModel(nnx.Module):
         if positions is None:
             positions = forward_batch.positions
 
+        from sgl_jax.srt.layers.attention.qsa_sparse_backend import QSAFusedCache
+
         layers_kv_fused = []
+        layers_compressed = []
+        layers_rings = []
         layers_rec_buffers = []
         layers_conv_buffers = []
         layers_topk_ids = []
@@ -379,7 +387,11 @@ class Qwen4ExpModel(nnx.Module):
                 memory_pools,
                 dispatch_info=forward_batch.expert_location_metadata,
             )
-            if layer.is_full_attn:
+            if isinstance(attn_state, QSAFusedCache):
+                layers_kv_fused.append(attn_state.kv)
+                layers_compressed.append(attn_state.compressed)
+                layers_rings.append(attn_state.ring)
+            elif layer.is_full_attn:
                 layers_kv_fused.append(attn_state)
             else:
                 rec_buf, conv_buf_list = attn_state
@@ -391,9 +403,16 @@ class Qwen4ExpModel(nnx.Module):
                 layers_topk_ids.append(topk_ids)
 
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        # Under QSA the KV pool also takes back each layer's compressed indexer
+        # cache and ring, as one tuple led by the KV list.
+        kv_update = (
+            (layers_kv_fused, layers_compressed, layers_rings)
+            if layers_compressed
+            else layers_kv_fused
+        )
         return (
             hidden_states,
-            layers_kv_fused,
+            kv_update,
             (layers_rec_buffers, layers_conv_buffers),
             layers_topk_ids,
         )

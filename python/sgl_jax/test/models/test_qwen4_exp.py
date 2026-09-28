@@ -13,6 +13,7 @@ import importlib.util
 import os
 import types
 import unittest
+from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -23,10 +24,12 @@ from flax import nnx
 from jax.sharding import AxisType, Mesh
 
 from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
+from sgl_jax.srt.layers.attention.qsa_sparse_backend import QSAFusedCache
 from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, RotaryEmbedding
 from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
 from sgl_jax.srt.models.qwen4_exp import (
     Qwen4ExpAttention,
+    Qwen4ExpDecoderLayer,
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpModel,
     _create_qwen4_exp_weight_mappings,
@@ -189,7 +192,8 @@ class TestRotary(CustomTestCase):
     def test_the_layer_hands_the_backend_what_it_needs(self):
         """Run the layer against a backend that records its kwargs. A QSA
         backend gets the indexer's projections plus the indexer and its rotary,
-        which it runs per rank; any other backend gets none of them.
+        which it runs per rank -- also when it sits inside the hybrid wrapper,
+        as Flash-Next's does. Any other backend gets none of them.
 
         Under mrope the layer is handed three rows of positions, and the
         indexer's plain rotary must read the scalar ones instead, which only a
@@ -202,14 +206,18 @@ class TestRotary(CustomTestCase):
         tokens = 4
         width = text.num_attention_heads * text.head_dim
 
-        def run(full_slot):
+        def run(full_slot, *, wrapped=False):
             seen = {}
 
             def backend(q, k, v, layer, forward_batch, pool, **kwargs):
                 seen.update(kwargs)
                 return jnp.zeros((tokens, width)), "kv"
 
-            backend.full_slot = full_slot
+            if wrapped:
+                # The hybrid wrapper routes full-attention layers to full_attn_backend.
+                backend.full_attn_backend = types.SimpleNamespace(full_slot=full_slot)
+            else:
+                backend.full_slot = full_slot
             forward_batch = types.SimpleNamespace(
                 attn_backend=backend, positions=jnp.arange(tokens, dtype=jnp.int32)
             )
@@ -227,7 +235,57 @@ class TestRotary(CustomTestCase):
         )
         self.assertEqual(seen["indexer_k"].shape, (tokens, text.indexer_head_dim))
 
+        self.assertEqual(sorted(run({attn.layer_id: 0}, wrapped=True)), sorted(seen))
         self.assertEqual(run(None), {})
+
+
+class TestPoolUpdates(CustomTestCase):
+    def test_the_kv_pool_update_splits_qsa_state(self):
+        """A QSA backend returns each full layer's KV cache bundled with its
+        compressed indexer cache and ring, and the pool takes them back as one
+        (kv, compressed, ring) tuple; any other backend's caches go back as a
+        plain list. The layers are stand-ins returning labelled states, so
+        this checks the bookkeeping, not the arithmetic."""
+        cfg = _config()
+        mesh = _mesh()
+        model = _model(cfg, mesh)
+        full = cfg.text_config.full_attention_layer_ids
+        tokens = 3
+
+        def run(qsa):
+            def layer_call(self, positions, hidden, forward_batch, pools, dispatch_info=None):
+                i = self.layer_id
+                if not self.is_full_attn:
+                    return hidden, (f"rec{i}", [f"conv{i}"]), None, None
+                state = QSAFusedCache(f"kv{i}", f"compressed{i}", f"ring{i}") if qsa else f"kv{i}"
+                return hidden, state, None, None
+
+            forward_batch = types.SimpleNamespace(
+                forward_mode=types.SimpleNamespace(
+                    is_extend_or_draft_extend_or_mixed=lambda: False
+                ),
+                input_ids=jnp.zeros((tokens,), jnp.int32),
+                mrope_positions=None,
+                positions=jnp.arange(tokens, dtype=jnp.int32),
+                expert_location_metadata=None,
+            )
+            mixer = type(model.hyper_connection_mixer)
+            with (
+                mock.patch.object(Qwen4ExpDecoderLayer, "__call__", layer_call),
+                mock.patch.object(mixer, "mix", lambda self, hidden: (hidden, None)),
+                jax.set_mesh(mesh),
+            ):
+                return model(forward_batch, None)[1]
+
+        self.assertEqual(
+            run(qsa=True),
+            (
+                [f"kv{i}" for i in full],
+                [f"compressed{i}" for i in full],
+                [f"ring{i}" for i in full],
+            ),
+        )
+        self.assertEqual(run(qsa=False), [f"kv{i}" for i in full])
 
 
 # The released config.json, reduced to what differs from Qwen4ExpTextConfig's
