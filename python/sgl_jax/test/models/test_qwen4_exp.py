@@ -186,31 +186,48 @@ class TestRotary(CustomTestCase):
         self.assertNotIsInstance(attn.indexer_rotary_emb, MRotaryEmbedding)
         self.assertEqual(attn.rotary_emb.head_size, text.head_dim)
 
-        # The mismatch only shows at the call, and only on the path the model
-        # actually takes, so drive _indexer_step and record what it hands over.
-        seen = {}
+    def test_the_layer_hands_the_backend_what_it_needs(self):
+        """Run the layer against a backend that records its kwargs. A QSA
+        backend gets the indexer's projections plus the indexer and its rotary,
+        which it runs per rank; any other backend gets none of them.
 
-        def _project(hidden, positions, rotary_emb):
-            seen["rotary"] = rotary_emb
-            return jnp.zeros((4, text.indexer_n_heads, text.indexer_head_dim)), jnp.zeros(
-                (4, text.indexer_head_dim)
-            )
-
-        attn.indexer.project = _project
-        attn.indexer.compress_batch = lambda *a, **k: (None, None, None, None)
-        forward_batch = types.SimpleNamespace(
-            attn_backend=types.SimpleNamespace(
-                full_slot={attn.layer_id: 0},
-                forward_metadata=types.SimpleNamespace(cu_q_lens=jnp.asarray([0, 4], jnp.int32)),
-            ),
-            req_pool_indices=jnp.asarray([0], jnp.int32),
-            positions=jnp.arange(4, dtype=jnp.int32),
-        )
-        pool = types.SimpleNamespace(get_open_group_buffer=lambda slot: None)
-
+        Under mrope the layer is handed three rows of positions, and the
+        indexer's plain rotary must read the scalar ones instead, which only a
+        real projection through the real call would notice."""
+        cfg = _config(mrope=True)
+        text = cfg.text_config
+        mesh = _mesh()
         with jax.set_mesh(mesh):
-            attn._indexer_step(jnp.zeros((4, text.hidden_size)), forward_batch, pool)
-        self.assertIs(seen["rotary"], attn.indexer_rotary_emb)
+            attn = Qwen4ExpAttention(cfg, mesh, layer_id=INTERVAL - 1)
+        tokens = 4
+        width = text.num_attention_heads * text.head_dim
+
+        def run(full_slot):
+            seen = {}
+
+            def backend(q, k, v, layer, forward_batch, pool, **kwargs):
+                seen.update(kwargs)
+                return jnp.zeros((tokens, width)), "kv"
+
+            backend.full_slot = full_slot
+            forward_batch = types.SimpleNamespace(
+                attn_backend=backend, positions=jnp.arange(tokens, dtype=jnp.int32)
+            )
+            mrope_positions = jnp.tile(jnp.arange(tokens, dtype=jnp.int32), (3, 1))
+            with jax.set_mesh(mesh):
+                attn(mrope_positions, jnp.zeros((tokens, text.hidden_size)), forward_batch, None)
+            return seen
+
+        seen = run({attn.layer_id: 0})
+        self.assertEqual(sorted(seen), ["indexer", "indexer_k", "indexer_q", "indexer_rotary_emb"])
+        self.assertIs(seen["indexer"], attn.indexer)
+        self.assertIs(seen["indexer_rotary_emb"], attn.indexer_rotary_emb)
+        self.assertEqual(
+            seen["indexer_q"].shape, (tokens, text.indexer_n_heads, text.indexer_head_dim)
+        )
+        self.assertEqual(seen["indexer_k"].shape, (tokens, text.indexer_head_dim))
+
+        self.assertEqual(run(None), {})
 
 
 # The released config.json, reduced to what differs from Qwen4ExpTextConfig's
