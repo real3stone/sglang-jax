@@ -155,44 +155,35 @@ class Qwen4ExpAttention(nnx.Module):
             out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
         )
 
-    def _indexer_step(self, hidden_states, forward_batch, token_to_kv_pool):
-        """``None`` when the backend has no compressed cache for this layer.
+    def _indexer_step(self, hidden_states, forward_batch):
+        """The indexer inputs the backend needs, or ``None`` when it keeps no
+        compressed cache for this layer.
 
-        Reads ``forward_batch.positions`` rather than whatever the attention
-        was handed: a compressed key is rotated at its group's first position,
-        an index that only exists in the scalar sequence.
+        Only the projection happens here. The backend compresses and writes the
+        keys itself, inside its shard_map, where each data-parallel rank sees
+        its own requests, so it is handed the indexer and its rotary too.
+
+        Reads ``forward_batch.positions``, the scalar sequence, rather than the
+        positions the attention was handed, which are multimodal under mrope:
+        the indexer's rotary is the plain one, and a compressed key is rotated
+        at its group's first position, an index only the scalar sequence has.
         """
-        backend = forward_batch.attn_backend
-        slot_map = getattr(backend, "full_slot", None)
+        slot_map = getattr(forward_batch.attn_backend, "full_slot", None)
         if slot_map is None or self.layer_id not in slot_map:
             return None
-        slot = slot_map[self.layer_id]
-
-        positions = forward_batch.positions
-        indexer_q, raw_key = self.indexer.project(hidden_states, positions, self.indexer_rotary_emb)
-        # cu_q_lens comes from the backend's metadata rather than being derived
-        # again here, so the compression and the selection agree on the batch.
-        compressed, groups, seq_ids, ring = self.indexer.compress_batch(
-            raw_key,
-            positions,
-            backend.forward_metadata.cu_q_lens,
-            forward_batch.req_pool_indices,
-            token_to_kv_pool.get_open_group_buffer(slot),
-            self.indexer_rotary_emb,
+        indexer_q, raw_key = self.indexer.project(
+            hidden_states, forward_batch.positions, self.indexer_rotary_emb
         )
         return {
             "indexer_q": indexer_q,
-            "compressed": compressed,
-            "groups": groups,
-            "seq_ids": seq_ids,
-            "ring": ring,
+            "indexer_k": raw_key,
+            "indexer": self.indexer,
+            "indexer_rotary_emb": self.indexer_rotary_emb,
         }
 
     def __call__(self, positions, hidden_states, forward_batch, token_to_kv_pool):
         T = hidden_states.shape[0]
-        qsa_kwargs = (
-            self._indexer_step(hidden_states, positions, forward_batch, token_to_kv_pool) or {}
-        )
+        qsa_kwargs = self._indexer_step(hidden_states, forward_batch) or {}
 
         q_raw, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
