@@ -276,8 +276,13 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             jnp.ones((self.num_v_heads,), dtype=dtype, out_sharding=P("tensor"))
         )
 
-        # GDN output norm: plain RMSNorm over head_v_dim, then explicit silu(z)
-        # gate (norm-before-gate, silu — matches torch RMSNormGated).
+        # GDN output norm: plain RMSNorm over head_v_dim, then a gate on z
+        # (norm-before-gate) whose activation the config picks; "swish" is silu.
+        output_gate = getattr(text_cfg, "output_gate_type", None) or "silu"
+        output_gate = "silu" if output_gate == "swish" else output_gate
+        if output_gate not in ("silu", "sigmoid"):
+            raise ValueError(f"unsupported GDN output_gate_type {output_gate!r}")
+        self.output_gate = output_gate
         self.norm = RMSNorm(self.head_v_dim, epsilon=text_cfg.rms_norm_eps, param_dtype=dtype)
         self.out_proj = LinearBase(
             input_size=self.value_dim,
@@ -310,8 +315,9 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         return jax.sharding.reshard(x, P("data", "tensor"))
 
     def _norm_gate(self, core_out, z):
-        """Per-head RMSNorm over head_v_dim, then a silu(z) gate (silu, NOT the
-        sigmoid of torch RMSNormGated). A method so the activation is unit-tested.
+        """Per-head RMSNorm over head_v_dim, then the output gate on z: silu(z),
+        or sigmoid(z) when the config selects it. A method so the activation is
+        unit-tested.
         """
         T = core_out.shape[0]
         core_out = core_out.reshape(
@@ -326,7 +332,8 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             self.value_dim,
             out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
         )
-        return core_out * jax.nn.silu(z)
+        gate = jax.nn.sigmoid if self.output_gate == "sigmoid" else jax.nn.silu
+        return core_out * gate(z)
 
     def __call__(self, positions, hidden_states, forward_batch, recurrent_state_pool):
         del positions  # GDN is position-agnostic.

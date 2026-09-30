@@ -26,7 +26,10 @@ from jax.sharding import AxisType, Mesh
 from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sgl_jax.srt.layers.attention.qsa_sparse_backend import QSAFusedCache
 from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, RotaryEmbedding
-from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
+from sgl_jax.srt.models.qwen3_5 import (
+    Qwen3_5GatedDeltaNet,
+    _create_qwen3_5_weight_mappings,
+)
 from sgl_jax.srt.models.qwen4_exp import (
     Qwen4ExpAttention,
     Qwen4ExpDecoderLayer,
@@ -54,7 +57,7 @@ def _mesh():
 MROPE_SECTION = [3, 3, 2]
 
 
-def _config(*, num_layers=NUM_LAYERS, ple=False, mrope=False):
+def _config(*, num_layers=NUM_LAYERS, ple=False, mrope=False, **overrides):
     text = dict(
         num_hidden_layers=num_layers,
         full_attention_interval=INTERVAL,
@@ -86,6 +89,7 @@ def _config(*, num_layers=NUM_LAYERS, ple=False, mrope=False):
             rope_theta=10000000,
             partial_rotary_factor=0.25,
         )
+    text.update(overrides)
     return Qwen4ExpConfig(text_config=text)
 
 
@@ -157,6 +161,33 @@ class TestBackboneStructure(CustomTestCase):
         )
         with self.assertRaises(ValueError):
             model.layers[0]._to_streams(jnp.zeros((3, text.hidden_size + 1)))
+
+
+class TestGatedDeltaNet(CustomTestCase):
+    def test_the_output_gate_follows_the_config(self):
+        """Flash-Next gates the GDN output with sigmoid(z) where Qwen3.5 uses
+        silu(z), and output_gate_type says which. Either passes a shape test,
+        so the values are compared."""
+        mesh = _mesh()
+        T = 4
+        for gate_type, act, other in (
+            ("sigmoid", jax.nn.sigmoid, jax.nn.silu),
+            ("swish", jax.nn.silu, jax.nn.sigmoid),
+        ):
+            with self.subTest(gate_type):
+                cfg = _config(output_gate_type=gate_type)
+                n_v = cfg.text_config.linear_num_value_heads
+                d_v = cfg.text_config.linear_value_head_dim
+                with jax.set_mesh(mesh):
+                    gdn = Qwen3_5GatedDeltaNet(cfg, mesh, 0)
+                    core = jax.random.normal(jax.random.key(0), (T, n_v, d_v))
+                    z = jax.random.normal(jax.random.key(1), (T, n_v * d_v))
+                    got = np.asarray(gdn._norm_gate(core, z), np.float32)
+                    normed = gdn.norm(core).reshape(T, n_v * d_v)
+                    want = np.asarray(normed * act(z), np.float32)
+                    wrong = np.asarray(normed * other(z), np.float32)
+                np.testing.assert_allclose(got, want, rtol=2e-2, atol=1e-2)
+                self.assertFalse(np.allclose(got, wrong, rtol=2e-2, atol=1e-2))
 
 
 class TestRotary(CustomTestCase):
