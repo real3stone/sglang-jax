@@ -23,9 +23,11 @@ import numpy as np
 from flax import nnx
 from jax.sharding import AxisType, Mesh
 
+from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sgl_jax.srt.layers.attention.qsa_sparse_backend import QSAFusedCache
 from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, RotaryEmbedding
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
     _create_qwen3_5_weight_mappings,
@@ -363,6 +365,20 @@ class TestReleasedConfig(CustomTestCase):
         self.assertEqual(len(model.language_model.model.layers), 48)
         self.assertIsNone(model.visual)
         self.assertEqual(model.get_multimodal_encode_funcs(), {})
+
+    def test_the_server_default_moe_backend_resolves_to_the_fused_kernel(self):
+        """The MoE block builds FusedEPMoE whatever --moe-backend says, so the
+        server default must resolve to fused for this architecture; otherwise
+        the fused kernel's batch-size rules are not checked at startup."""
+        model = _model(_config(), _mesh())
+        self.assertTrue(any(isinstance(m, FusedEPMoE) for _, m in nnx.iter_graph(model)))
+
+        text = dict(RELEASED_TEXT, ple_layer_ids=[])
+        cfg = Qwen4ExpConfig(
+            text_config=text, architectures=[Qwen4ExpForConditionalGeneration.__name__]
+        )
+        model_config = ModelConfig("unused", hf_config=cfg, moe_backend="epmoe")
+        self.assertEqual(model_config.moe_backend, MoEBackend.FUSED)
 
 
 def _mapping_head(config):
