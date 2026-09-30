@@ -20,6 +20,9 @@ from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     fused_ep_moe,
     ref_moe,
 )
+from sgl_jax.srt.kernels.fused_moe.v1.tuned_block_configs import (
+    get_tuned_fused_moe_block_config,
+)
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.moe import TopK, create_moe_weights_mapping
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
@@ -515,6 +518,47 @@ class MoEKernelTest(jtu.JaxTestCase):
             num_tokens=num_tokens,
             seed=seed,
             renormalize_topk_logits=renormalize_topk_logits,
+            act_fn="silu",
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    @parameterized.product(num_tokens=[16, 512])
+    def test_flash_next_fallback_tiles(self, num_tokens):
+        """Qwen3.8-Flash-Next's MoE (hidden 2560, expert intermediate 640,
+        top-10) has no tuned entry, so the default config is reduced to bf=128
+        and bd=512: five intermediate by five hidden tiles per expert, which no
+        other case here runs. 16 tokens is the decode batch the model serves."""
+        num_experts, top_k, hidden_size, intermediate_size = 128, 10, 2560, 640
+        ep_size = self.mesh.size
+        cfg = get_tuned_fused_moe_block_config(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=jnp.bfloat16,
+            weight_dtype=jnp.bfloat16,
+            ep_size=ep_size,
+            use_shared_expert=False,
+            use_grouped_topk=False,
+        ).effective_for(
+            num_tokens=num_tokens,
+            ep_size=ep_size,
+            dtype=jnp.bfloat16,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+        )
+        self.assertEqual((cfg.bf, cfg.bd1, cfg.bd2), (128, 512, 512))
+        self._test_moe(
+            dtype=jnp.bfloat16,
+            top_k=top_k,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_tokens=num_tokens,
+            seed=54321,
+            renormalize_topk_logits=True,
             act_fn="silu",
             atol=5e-2,
             rtol=5e-2,
