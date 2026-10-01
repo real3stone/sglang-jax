@@ -538,8 +538,8 @@ def compare(ref: list[dict], got: list[dict]) -> dict:
     }
 
 
-def run_bench(run: Run, srv: Server, args) -> dict:
-    out_file = run.out / f"bench_serving_{srv.backend}.jsonl"
+def run_bench(run: Run, srv: Server, args, bench: dict = BENCH, tag: str = "") -> dict:
+    out_file = run.out / f"bench_serving_{srv.backend}{tag}.jsonl"
     out_file.unlink(missing_ok=True)
     cmd = [
         sys.executable, "-m", "sgl_jax.bench_serving",
@@ -547,16 +547,16 @@ def run_bench(run: Run, srv: Server, args) -> dict:
         "--base-url", srv.base,
         "--tokenizer", args.model_path,
         "--dataset-name", "random",
-        "--random-input-len", str(BENCH["input_len"]),
-        "--random-output-len", str(BENCH["output_len"]),
+        "--random-input-len", str(bench["input_len"]),
+        "--random-output-len", str(bench["output_len"]),
         "--random-range-ratio", "1",
-        "--num-prompts", str(BENCH["num_prompts"]),
-        "--max-concurrency", str(BENCH["concurrency"]),
+        "--num-prompts", str(bench["num_prompts"]),
+        "--max-concurrency", str(bench["concurrency"]),
         "--warmup-requests", "0",
         "--output-file", str(out_file),
     ]  # fmt: skip
     run.log(f"  bench_serving：{shlex.join(cmd)}")
-    log = run.out / f"bench_serving_{srv.backend}.log"
+    log = run.out / f"bench_serving_{srv.backend}{tag}.log"
     with open(log, "w") as f:
         r = subprocess.run(cmd, cwd=args.repo, stdout=f, stderr=subprocess.STDOUT, check=False)
     if r.returncode != 0 or not out_file.exists():

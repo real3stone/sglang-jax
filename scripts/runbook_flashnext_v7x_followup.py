@@ -1,4 +1,5 @@
-"""Qwen3.8-Flash-Next 跑通测试的补充测试：超出 indexer 预算后，稀疏选块能不能把开头的内容找回来。
+"""Qwen3.8-Flash-Next 跑通测试的补充测试：超出 indexer 预算后，稀疏选块能不能把开头的内容找回来；
+以及 QSA 的开销随上下文长度怎么变、时间花在哪些算子上。
 
 和 runbook_flashnext_v7x.py 用同一套启动参数（N-gram / PLE 层关闭），只测那份 runbook 没覆盖到
 的部分。结束时留下一份报告和一个压缩包。
@@ -10,8 +11,12 @@
       - needle 四档：长文开头埋一个 6 位口令，末尾问它，约 500 / 1500 / 6000 / 14000 token。
         前两档在 indexer 预算（2048 token）以内，后两档超出。贪心生成 512 个 token（模型先在
         <think> 里思考再回答），记下完整输出、有没有找到口令、口令是否出现在 </think> 之后。
-      - bench_serving，参数和 runbook 的 C4 相同。
-  F2  稀疏注意力（qsa_sparse）启动：同样四档 needle。
+      - 性能，两个后端都做，只记录、不判定：
+        bench_serving 两组，输入 512 / 输出 128 / 100 个请求，和输入 8192 / 输出 128 / 32 个
+        请求，都是并发 8。看 TTFT、TPOT 随输入长度怎么变。
+        压测完服务已经预热好，再用 jax.profiler 抓一段 profile：prefill、decode 各几步，
+        用 8 个并发请求（输入 512 / 输出 64）凑出来。trace 存在 profile_<后端>/，体积较大。
+  F2  稀疏注意力（qsa_sparse）启动：同样四档 needle，同样的性能测量。
 
 判定
   预算内两档：两边数学上相同，都应该找到。
@@ -26,7 +31,8 @@
 状态
   PASS 通过；WARN 有可疑之处；FAIL 失败；未运行：这次没选这个阶段。
   F0 的 FAIL 是本机环境问题：按列出的问题修好后重跑，这种情况不打包、不用发回。
-  F1、F2 不管什么结果都不用自己排查，把压缩包原样发回。
+  F1、F2 不管什么结果都不用自己排查，把压缩包原样发回（里面有 profile trace，体积较大，
+  整个发回）。性能测量失败只记 WARN，不影响 needle 的判定。
 
 用法：和 runbook 一样，在 sglang-jax 仓库根目录下、tmux 里运行。
   python scripts/runbook_flashnext_v7x_followup.py --model-path /data/Qwen3.8-Flash-Next
@@ -40,10 +46,13 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import tarfile
+import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -52,8 +61,8 @@ import runbook_flashnext_v7x as rb  # noqa: E402
 STAGES = ("F0", "F1", "F2")
 STAGE_INFO = {
     "F0": "环境检查：TPU 设备、仓库和代码版本",
-    "F1": "fa：四档 needle（预算内两档必须找到）+ 压测",
-    "F2": "qsa_sparse：四档 needle，超出预算后选块能不能找回口令",
+    "F1": "fa：四档 needle（预算内两档必须找到）+ 两种输入长度的压测 + profile",
+    "F2": "qsa_sparse：四档 needle（超出预算后选块能不能找回口令）+ 压测 + profile",
 }
 rb.STAGE_INFO.update(STAGE_INFO)  # stage_launch 打印阶段标题时查这张表
 
@@ -61,6 +70,22 @@ INDEXER_BUDGET = 2048
 NEEDLES = [(500, "615208"), *rb.NEEDLES]  # 500 档确认关掉 PLE 后模型本身能找回口令
 
 RANK = {"PASS": 0, "WARN": 1, "FAIL": 2}
+
+# 两种输入长度：看 TPOT 随上下文怎么变（第一组就是 runbook 的 C4）
+BENCH_SWEEP = [
+    rb.BENCH,
+    {"input_len": 8192, "output_len": 128, "num_prompts": 32, "concurrency": 8},
+]
+PROFILE_LOAD = {"input_len": 512, "output_len": 64, "num_prompts": 8, "concurrency": 8}
+PROFILE_REQUEST = {
+    "num_steps": 5,
+    "profile_by_stage": True,
+    "profile_stages": ["prefill", "decode"],
+    "host_tracer_level": 2,
+    "python_tracer_level": 0,
+}
+PROFILE_WAIT_SECONDS = 600
+PROFILE_MAX_MB = 500  # 超过就只留 xplane.pb
 
 
 def stage_f0(run: rb.Run, args) -> bool:
@@ -98,20 +123,84 @@ def stage_f0(run: rb.Run, args) -> bool:
     return not problems
 
 
+def http(srv: rb.Server, path: str, payload: dict | None = None) -> str:
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(
+        srv.base + path, data=data, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read().decode()
+
+
+def capture_profile(run: rb.Run, srv: rb.Server, args) -> dict:
+    """在预热好的服务上抓 prefill、decode 各几步的 profile。
+
+    按阶段抓取时，服务端在阶段切换或者凑够步数时自己停；等它回到 idle，没回去就手动停。
+    """
+    out = run.out / f"profile_{srv.backend}"
+    shutil.rmtree(out, ignore_errors=True)
+    http(srv, "/start_profile", {**PROFILE_REQUEST, "output_dir": str(out.resolve())})
+    rb.run_bench(run, srv, args, PROFILE_LOAD, tag="_profile")
+    deadline = time.time() + PROFILE_WAIT_SECONDS
+    while json.loads(http(srv, "/profile_status"))["status"] != "idle":
+        if time.time() > deadline:
+            http(srv, "/stop_profile")
+            run.log(f"  profile 等了 {PROFILE_WAIT_SECONDS} 秒没有自己停，已手动停止")
+            break
+        time.sleep(10)
+    files = [p for p in out.rglob("*") if p.is_file()]
+    if sum(p.stat().st_size for p in files) > PROFILE_MAX_MB * 2**20:
+        for p in files:
+            if not p.name.endswith(".xplane.pb"):
+                p.unlink()
+        files = [p for p in files if p.exists()]
+    if not any(p.name.endswith(".xplane.pb") for p in files):
+        raise RuntimeError(f"{out} 里没有生成 xplane.pb")
+    size_mb = round(sum(p.stat().st_size for p in files) / 2**20, 1)
+    stages = sorted({p.relative_to(out).parts[0] for p in files})
+    return {"dir": out.name, "stages": stages, "files": len(files), "size_mb": size_mb}
+
+
+def measure_perf(run: rb.Run, srv: rb.Server, args) -> tuple[dict, list[str]]:
+    """两种输入长度各压测一组，然后抓 profile。只记录，出错的项写进返回的错误列表。"""
+    bench, errors = {}, []
+    for cfg in BENCH_SWEEP:
+        key = str(cfg["input_len"])
+        try:
+            bench[key] = rb.run_bench(run, srv, args, cfg, tag=f"_in{key}")
+            run.log(f"  bench_serving（{srv.backend}，输入 {key}）：{bench[key]}")
+        except Exception as e:  # noqa: BLE001 - 一组失败，另一组和 profile 照样做
+            errors.append(f"bench_serving（输入 {key}）：{type(e).__name__}: {e}")
+    try:
+        profile = capture_profile(run, srv, args)
+        run.log(f"  profile（{srv.backend}）：{profile}")
+    except Exception as e:  # noqa: BLE001
+        profile = {}
+        errors.append(f"profile：{type(e).__name__}: {e}")
+    for e in errors:
+        run.log(f"  性能测量出错：{e}")
+    return {"bench": bench, "profile": profile, "perf_errors": errors}, errors
+
+
 def stage_f1(run: rb.Run, args) -> None:
     def f1(srv, ready, checks):
         run.log(f"  加载摘要（只记录）：{checks['load_summary']}")
-        needles = rb.run_needles(run, srv, NEEDLES)
+        status, details = "PASS", {"load_summary": checks["load_summary"]}
         try:
-            bench = rb.run_bench(run, srv, args)
-        except Exception as e:  # noqa: BLE001 - 压测出错只记下来，不影响 needle 的结论
-            bench = {"error": f"{type(e).__name__}: {e}"}
-        run.log(f"  bench_serving（fa）：{bench}")
-        missed = [n["target_tokens"] for n in needles if in_budget(n) and not n["found"]]
-        if missed:
-            run.log(f"  预算内 fa 没找到：{missed}（问题在测试或模型本身，不算 QSA）")
-        status = "WARN" if missed or "error" in bench else "PASS"
-        run.record("F1", status, needles=needles, bench=bench, load_summary=checks["load_summary"])
+            details["needles"] = rb.run_needles(run, srv, NEEDLES)
+            missed = [
+                n["target_tokens"] for n in details["needles"] if in_budget(n) and not n["found"]
+            ]
+            if missed:
+                run.log(f"  预算内 fa 没找到：{missed}（问题在测试或模型本身，不算 QSA）")
+                status = "WARN"
+        except Exception as e:  # noqa: BLE001 - needle 出错时，性能测量照样做
+            details["error"] = f"needle 出错：{type(e).__name__}: {e}"
+            status = "FAIL"
+        perf, errors = measure_perf(run, srv, args)
+        if errors and status == "PASS":
+            status = "WARN"
+        run.record("F1", status, **details, **perf)
 
     rb.stage_launch(run, args, "fa", [("F1", f1)])
 
@@ -131,15 +220,24 @@ def judge(n: int, fa: dict | None, qsa: dict) -> tuple[str, str]:
 
 def stage_f2(run: rb.Run, args) -> None:
     def f2(srv, ready, checks):
-        needles = rb.run_needles(run, srv, NEEDLES)
-        fa = {n["target_tokens"]: n for n in run.results.get("F1", {}).get("needles", [])}
-        verdicts = {}
-        for qsa in needles:
-            n = qsa["target_tokens"]
-            verdicts[n] = judge(n, fa.get(n), qsa)
-            run.log(f"  needle {n}：{verdicts[n][0]}，{verdicts[n][1]}")
-        status = max((v[0] for v in verdicts.values()), key=RANK.get)
-        run.record("F2", status, needles=needles, verdicts=verdicts)
+        status, details = "PASS", {}
+        try:
+            needles = rb.run_needles(run, srv, NEEDLES)
+            fa = {n["target_tokens"]: n for n in run.results.get("F1", {}).get("needles", [])}
+            verdicts = {}
+            for qsa in needles:
+                n = qsa["target_tokens"]
+                verdicts[n] = judge(n, fa.get(n), qsa)
+                run.log(f"  needle {n}：{verdicts[n][0]}，{verdicts[n][1]}")
+            status = max((v[0] for v in verdicts.values()), key=RANK.get)
+            details.update(needles=needles, verdicts=verdicts)
+        except Exception as e:  # noqa: BLE001 - needle 出错时，性能测量照样做
+            details["error"] = f"needle 出错：{type(e).__name__}: {e}"
+            status = "FAIL"
+        perf, errors = measure_perf(run, srv, args)
+        if errors and status == "PASS":
+            status = "WARN"
+        run.record("F2", status, **details, **perf)
 
     rb.stage_launch(run, args, "qsa_sparse", [("F2", f2)])
 
@@ -184,10 +282,38 @@ def write_report(run: rb.Run, repo: dict) -> Path:
                 f"| {n} | {tokens} | {budget} | {rb.needle_status(a)} | {rb.needle_status(b)} | "
                 f"{verdict} |"
             ]
-    lines += rb.bench_table(r.get("F1", {}).get("bench"), None)
+    lines += perf_table(r)
     path = run.out / "report.md"
     path.write_text("\n".join(lines) + "\n")
     return path
+
+
+def perf_table(r: dict) -> list[str]:
+    rows = [
+        (backend, key, m)
+        for s, backend in (("F1", "fa"), ("F2", "qsa_sparse"))
+        for key, m in r.get(s, {}).get("bench", {}).items()
+    ]
+    lines = []
+    if rows:
+        lines += [
+            "",
+            "性能（只记录；猜测 QSA 每步按最长上下文付费时，qsa_sparse 的 TPOT 基本不随输入长度变）",
+            "",
+            "| 后端 | 输入长度 | 完成数 | TTFT 中位数 ms | TPOT 中位数 ms | 输出吞吐 tok/s | 总吞吐 tok/s |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for backend, key, m in rows:
+            cells = [m.get(k, "-") for k in ("completed", "median_ttft_ms", "median_tpot_ms")]
+            cells += [m.get(k, "-") for k in ("output_throughput", "total_throughput")]
+            cells = [f"{c:.1f}" if isinstance(c, float) else c for c in cells]
+            lines += [f"| {backend} | {key} | " + " | ".join(map(str, cells)) + " |"]
+    for s in ("F1", "F2"):
+        c = r.get(s, {})
+        if c.get("profile"):
+            lines += [f"- {s} profile：{c['profile']}"]
+        lines += [f"- {s} 性能测量出错：{e}" for e in c.get("perf_errors", [])]
+    return lines
 
 
 def main() -> int:
