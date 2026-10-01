@@ -15,7 +15,8 @@
         bench_serving 两组，输入 512 / 输出 128 / 100 个请求，和输入 8192 / 输出 128 / 32 个
         请求，都是并发 8。看 TTFT、TPOT 随输入长度怎么变。
         压测完服务已经预热好，再用 jax.profiler 抓一段 profile：prefill、decode 各几步，
-        用 8 个并发请求（输入 512 / 输出 64）凑出来。trace 存在 profile_<后端>/，体积较大。
+        用 8 个并发请求（输入 1536 / 输出 64）凑出来：prefill 约 12k token，按 2048 一批切
+        能凑满步数。trace 存在 profile_<后端>/，体积较大。
   F2  稀疏注意力（qsa_sparse）启动：同样四档 needle，同样的性能测量。
 
 判定
@@ -78,7 +79,8 @@ BENCH_SWEEP = [
     rb.BENCH,
     {"input_len": 8192, "output_len": 128, "num_prompts": 32, "concurrency": 8},
 ]
-PROFILE_LOAD = {"input_len": 512, "output_len": 64, "num_prompts": 8, "concurrency": 8}
+# 8 x 1536 = 12288 个 prefill token，按 chunked prefill 2048 一批切成 6 批，凑得满 5 步 prefill
+PROFILE_LOAD = {"input_len": 1536, "output_len": 64, "num_prompts": 8, "concurrency": 8}
 PROFILE_REQUEST = {
     "num_steps": 5,
     "profile_by_stage": True,
