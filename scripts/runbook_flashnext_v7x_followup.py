@@ -21,7 +21,9 @@
 判定
   预算内两档：两边数学上相同，都应该找到。
     fa 没找到：F1 判 WARN，问题在测试或模型本身，不算到 QSA 头上；
-    fa 找到而 qsa_sparse 没找到：F2 判 FAIL。
+    fa 找到而 qsa_sparse 没找到：两边输出在前 8 个 token 内就分叉，F2 判 FAIL；分叉在 8 个
+    token 之后，判 WARN（和 runbook 的 C3 同一个口径：接近平局的 token 在 bf16 下会翻转，
+    之后 512 个 token 的思考路径就可能完全不同）。
   超出预算两档：
     qsa_sparse 找到：PASS；
     qsa_sparse 没找到而 fa 找到：WARN（选块可疑）；
@@ -205,13 +207,30 @@ def stage_f1(run: rb.Run, args) -> None:
     rb.stage_launch(run, args, "fa", [("F1", f1)])
 
 
+def divergence(a: dict, b: dict) -> int | None:
+    """两段输出第一个不同 token 的位置；一边先结束算在它结束的位置，完全相同返回 None。"""
+    x, y = a.get("token_ids", []), b.get("token_ids", [])
+    n = min(len(x), len(y))
+    div = next((i for i in range(n) if x[i] != y[i]), None)
+    return n if div is None and len(x) != len(y) else div
+
+
 def judge(n: int, fa: dict | None, qsa: dict) -> tuple[str, str]:
     fa_found = None if fa is None else fa["found"]
     if qsa["found"]:
         return "PASS", "qsa_sparse 找到"
     if n < INDEXER_BUDGET:
         if fa_found:
-            return "FAIL", "预算内两边数学上相同，fa 找到而 qsa_sparse 没找到"
+            div = divergence(fa, qsa)
+            if div is None or div < rb.MIN_AGREEING_TOKENS:
+                return (
+                    "FAIL",
+                    f"预算内两边数学上相同，输出在第 {div} 个 token 就分叉，qsa_sparse 没找到",
+                )
+            return (
+                "WARN",
+                f"预算内两边在第 {div} 个 token 分叉（接近平局的翻转），之后 qsa_sparse 没找到",
+            )
         return "WARN", "预算内两边都没找到，问题在测试或模型本身"
     if fa_found:
         return "WARN", "超出预算，fa 找到而 qsa_sparse 没找到，选块可疑"
