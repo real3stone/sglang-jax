@@ -13,18 +13,21 @@
       启动后加载摘要要逐字等于 "consumed=1157, skipped=501, missing=0, unexpected=0"；
       再发一个请求，能正常出 token、logprob 里没有 NaN。
   C2  fa 的参考输出：8 个短 prompt 贪心生成，记下每个 token 和它的 logprob；3 个 needle
-      （长文开头埋一个 6 位口令，末尾问它）。
+      （长文开头埋一个 6 位口令，末尾问它；生成 512 个 token，模型先在 <think> 里思考再回答，
+      输出里任意位置出现口令就算找到，另外记下口令是否出现在 </think> 之后）；再跑一遍
+      bench_serving，参数和 C4 相同，给 C4 做对比。
   C3  稀疏注意力（qsa_sparse）启动 + 逐 token 对照。
       QSA 是这个模型的稀疏注意力：indexer 为每个 query 选出最多 2048 个 token 的 KV 块，
       注意力只在这些块上算。短 prompt 在预算以内，全部块都会被选中，数学上和 fa 相同，
       差别只来自两套 kernel 的 bf16 数值，所以要求前 8 个 token 一致：一半以上的 prompt
-      做不到判 FAIL；个别做不到，或者一致部分的 logprob 差超过 0.1，判 WARN。第一个 token
+      做不到判 FAIL；个别做不到，或者一致部分的概率差超过 0.1，判 WARN。第一个 token
       就分叉指向 prefill，之后才分叉指向 decode。needle 检验稀疏选块能不能把开头的内容
       找回来（第一个在预算以内，另外两个超出预算）：fa 找到了而 qsa 没找到，判 WARN。
       C3 只验证 QSA 这一部分：GDN、MoE、超连接两边共用，它们的错 C3 看不到。
   C4  性能（qsa_sparse）：bench_serving 随机 512 token 输入 / 128 token 输出、100 个请求、
       并发 8，配置和 sgl-project/sglang-jax#1656 一致。记录吞吐、TTFT、TPOT，要求 100 个
-      请求全部成功。数字不含 PLE 的开销。C3 的逐 token 对照判 FAIL 时不跑：实现有错，
+      请求全部成功；和 C2 里 fa 的同口径数字放在一起，才拆得出 QSA 自身的开销，缺了 fa
+      的数字判 WARN。数字不含 PLE 的开销。C3 的逐 token 对照判 FAIL 时不跑：实现有错，
       性能数字没有意义。
 
 状态
@@ -81,9 +84,9 @@ NOT_RUN = "未运行"
 STAGE_INFO = {
     "C0": "环境检查：TPU 设备、权重文件、仓库和代码版本",
     "C1": "MoE kernel 自检 + fa 真权重启动：加载摘要逐字比对，能正常出 token",
-    "C2": "fa 参考输出：短 prompt 逐 token 结果、needle 长文检索",
+    "C2": "fa 参考输出：短 prompt 逐 token 结果、needle 长文检索、压测对比数字",
     "C3": "qsa_sparse 启动：逐 token 对照 C2 验证 QSA 实现正确；needle 验证稀疏选块",
-    "C4": "性能：bench_serving 512 入 / 128 出、100 个请求、并发 8（不含 PLE）",
+    "C4": "性能：bench_serving 512 入 / 128 出、100 个请求、并发 8，对比 fa（不含 PLE）",
 }
 
 EXPECTED_DEVICES = 8
@@ -95,7 +98,9 @@ EXPECTED_LOAD_SUMMARY = "consumed=1157, skipped=501, missing=0, unexpected=0"
 PLE_OFF = {"text_config": {"ple_layer_ids": []}}
 
 MIN_AGREEING_TOKENS = 8  # 每个 prompt 前 8 个 token 要一致，之后 bf16 下接近平局的 token 可能翻转
-MAX_LOGPROB_DIFF_SHARED = 0.1  # 两边选了同一个 token 的位置上，logprob 最大允许差
+# 两边选了同一个 token 的位置上，概率最大允许差。用概率不用 logprob：低置信 token 上取对数
+# 会把很小的差距放大（p=0.22 对 0.13，logprob 差 0.52）。
+MAX_PROB_DIFF_SHARED = 0.1
 MAX_NEW_TOKENS = 32
 # 循环状态池也要显式给成这个数：只给 --max-running-requests 时，服务端按自动路径再预留约
 # 1/4 的快照槽，请求池只剩 12，低于 fused MoE 在 ep=8 下要求的最小值（2 * ep_size = 16）。
@@ -122,6 +127,7 @@ PROMPTS = [
 # (大约的 prompt token 数, 口令)。第一个在 indexer 预算（2048 token）以内，另外两个超出。
 NEEDLES = [(1500, "482917"), (6000, "730164"), (14000, "259803")]
 TOKENS_PER_WORD = 2.0  # 填充句大多是数字，Qwen 的分词器把数字逐位切开
+NEEDLE_MAX_NEW_TOKENS = 512  # 模型先在 <think> 里思考再回答，要给够 token 让它把口令说出来
 
 PROBE = (
     "import jax, flax, json, sgl_jax, os; d = jax.devices();"
@@ -403,23 +409,30 @@ def needle_prompt(approx_tokens: int, code: str) -> str:
     return head + "\n".join(lines) + tail
 
 
-def run_needles(run: Run, srv: Server) -> list[dict]:
+def run_needles(run: Run, srv: Server, needles=NEEDLES) -> list[dict]:
     out = []
-    for n, code in NEEDLES:
-        g = srv.generate(needle_prompt(n, code), 16)
-        found = code in g["text"]
-        run.log(
-            f"  needle 约 {n} token（实际 {g['prompt_tokens']}）：{'找到' if found else '没找到'}"
-        )
-        out.append(
-            {
-                "target_tokens": n,
-                "prompt_tokens": g["prompt_tokens"],
-                "found": found,
-                "output": g["text"],
-            }
-        )
+    for n, code in needles:
+        g = srv.generate(needle_prompt(n, code), NEEDLE_MAX_NEW_TOKENS)
+        text = g["text"]
+        answer = text.split("</think>", 1)[1] if "</think>" in text else ""
+        entry = {
+            "target_tokens": n,
+            "prompt_tokens": g["prompt_tokens"],
+            "found": code in text,
+            "after_think": code in answer,
+            "output": text,
+        }
+        run.log(f"  needle 约 {n} token（实际 {g['prompt_tokens']}）：{needle_status(entry)}")
+        out.append(entry)
     return out
+
+
+def needle_status(needle: dict | None) -> str:
+    if needle is None:
+        return "-"
+    if not needle["found"]:
+        return "没找到"
+    return "找到（</think> 之后）" if needle["after_think"] else "找到（只在思考里）"
 
 
 def moe_selftest(run: Run, args) -> str | None:
@@ -467,7 +480,13 @@ def stage_fa(run: Run, args) -> None:
             return
         prompts = run_prompts(srv)
         (run.out / "c2_prompts.json").write_text(json.dumps(prompts, indent=2, ensure_ascii=False))
-        run.record("C2", "PASS", needles=run_needles(run, srv))
+        needles = run_needles(run, srv)
+        try:
+            bench = run_bench(run, srv, args)
+        except Exception as e:  # noqa: BLE001 - 压测只给 C4 做对比，失败不影响参考输出
+            bench = {"error": f"{type(e).__name__}: {e}"}
+        run.log(f"  bench_serving（fa）：{bench}")
+        run.record("C2", "PASS", needles=needles, bench=bench)
 
     stage_launch(run, args, "fa", [("C1", c1), ("C2", c2)])
 
@@ -488,22 +507,25 @@ def compare(ref: list[dict], got: list[dict]) -> dict:
         if div is None and len(a["token_ids"]) != len(b["token_ids"]):
             div = n
         shared = n if div is None else div
-        d = [abs(x - y) for x, y in zip(a["logprobs"][:shared], b["logprobs"][:shared])]
+        d = [
+            abs(math.exp(x) - math.exp(y))
+            for x, y in zip(a["logprobs"][:shared], b["logprobs"][:shared])
+        ]
         first_token_flips += div == 0
         early += div is not None and div < MIN_AGREEING_TOKENS
         rows.append(
             {
                 "prompt": a["prompt"][:40],
                 "first_divergence": div,
-                "max_logprob_diff_shared": max(d) if d else None,
+                "max_prob_diff_shared": max(d) if d else None,
                 "fa": a["text"][:80],
                 "qsa": b["text"][:80],
             }
         )
-    worst = max((r["max_logprob_diff_shared"] or 0) for r in rows)
+    worst = max((r["max_prob_diff_shared"] or 0) for r in rows)
     if early > len(rows) // 2:
         status = "FAIL"
-    elif early or worst > MAX_LOGPROB_DIFF_SHARED:
+    elif early or worst > MAX_PROB_DIFF_SHARED:
         status = "WARN"
     else:
         status = "PASS"
@@ -511,13 +533,13 @@ def compare(ref: list[dict], got: list[dict]) -> dict:
         "status": status,
         "first_token_flips": first_token_flips,
         "early_divergences": early,
-        "worst_shared_logprob_diff": worst,
+        "worst_shared_prob_diff": worst,
         "rows": rows,
     }
 
 
 def run_bench(run: Run, srv: Server, args) -> dict:
-    out_file = run.out / "bench_serving.jsonl"
+    out_file = run.out / f"bench_serving_{srv.backend}.jsonl"
     out_file.unlink(missing_ok=True)
     cmd = [
         sys.executable, "-m", "sgl_jax.bench_serving",
@@ -534,7 +556,7 @@ def run_bench(run: Run, srv: Server, args) -> dict:
         "--output-file", str(out_file),
     ]  # fmt: skip
     run.log(f"  bench_serving：{shlex.join(cmd)}")
-    log = run.out / "bench_serving.log"
+    log = run.out / f"bench_serving_{srv.backend}.log"
     with open(log, "w") as f:
         r = subprocess.run(cmd, cwd=args.repo, stdout=f, stderr=subprocess.STDOUT, check=False)
     if r.returncode != 0 or not out_file.exists():
@@ -560,7 +582,7 @@ def stage_qsa(run: Run, args, wanted: set[str]) -> None:
         run.log(
             f"  逐 token 对照：{cmp['status']}；第一个 token 就分叉 {cmp['first_token_flips']} 个，"
             f"前 {MIN_AGREEING_TOKENS} 个 token 内分叉 {cmp['early_divergences']} 个，"
-            f"一致部分 logprob 最大差 {cmp['worst_shared_logprob_diff']:.4f}"
+            f"一致部分概率最大差 {cmp['worst_shared_prob_diff']:.4f}"
         )
         details = {"compare": cmp, "load_summary_ok": checks["load_summary_ok"]}
         try:
@@ -586,9 +608,13 @@ def stage_qsa(run: Run, args, wanted: set[str]) -> None:
             run.record("C4", NOT_RUN, reason="C3 的逐 token 对照没通过，QSA 实现大概率有错")
             return
         bench = run_bench(run, srv, args)
-        run.log(f"  bench_serving：{bench}")
-        ok = bench.get("completed") == BENCH["num_prompts"]
-        run.record("C4", "PASS" if ok else "FAIL", bench=bench)
+        run.log(f"  bench_serving（qsa_sparse）：{bench}")
+        status = "PASS" if bench.get("completed") == BENCH["num_prompts"] else "FAIL"
+        bench_fa = run.results.get("C2", {}).get("bench") or {}
+        if status == "PASS" and "completed" not in bench_fa:
+            run.log("  没有 fa 的压测数字，拆不出 QSA 自身的开销")
+            status = "WARN"
+        run.record("C4", status, bench=bench, bench_fa=bench_fa)
 
     steps = [(s, fn) for s, fn in (("C3", c3), ("C4", c4)) if s in wanted]
     stage_launch(run, args, "qsa_sparse", steps)
@@ -604,12 +630,6 @@ def stage_qsa(run: Run, args, wanted: set[str]) -> None:
 
 
 # ---- 报告 ---------------------------------------------------------------------
-
-
-def _found(needle: dict | None) -> str:
-    if needle is None:
-        return "-"
-    return "找到" if needle["found"] else "没找到"
 
 
 def write_report(run: Run, repo: dict) -> Path:
@@ -636,19 +656,15 @@ def write_report(run: Run, repo: dict) -> Path:
         lines += [
             "",
             f"逐 token 对照：第一个 token 就分叉 {cmp['first_token_flips']} 个，前 {MIN_AGREEING_TOKENS} 个 "
-            f"token 内分叉 {cmp['early_divergences']} 个，一致部分 logprob 最大差 "
-            f"{cmp['worst_shared_logprob_diff']:.4f}",
+            f"token 内分叉 {cmp['early_divergences']} 个，一致部分概率最大差 "
+            f"{cmp['worst_shared_prob_diff']:.4f}",
             "",
-            "| prompt | 首次分叉位置 | 一致部分 logprob 最大差 |",
+            "| prompt | 首次分叉位置 | 一致部分概率最大差 |",
             "| --- | --- | --- |",
         ]
         for x in cmp["rows"]:
             div = "无" if x["first_divergence"] is None else x["first_divergence"]
-            d = (
-                "-"
-                if x["max_logprob_diff_shared"] is None
-                else f"{x['max_logprob_diff_shared']:.2e}"
-            )
+            d = "-" if x["max_prob_diff_shared"] is None else f"{x['max_prob_diff_shared']:.3f}"
             lines += [f"| {x['prompt']!r} | {div} | {d} |"]
     fa, qsa = (
         {n["target_tokens"]: n for n in r.get(s, {}).get("needles", [])} for s in ("C2", "C3")
@@ -658,14 +674,27 @@ def write_report(run: Run, repo: dict) -> Path:
         for n, _ in NEEDLES:
             a, b = fa.get(n), qsa.get(n)
             tokens = (a or b or {}).get("prompt_tokens", "-")
-            lines += [f"| {n} | {tokens} | {_found(a)} | {_found(b)} |"]
-    bench = r.get("C4", {}).get("bench")
-    if bench:
-        lines += ["", f"性能（{BENCH}，不含 PLE 的开销）", "", "| 指标 | 值 |", "| --- | --- |"]
-        lines += [f"| {k} | {v} |" for k, v in bench.items()]
+            lines += [f"| {n} | {tokens} | {needle_status(a)} | {needle_status(b)} |"]
+    lines += bench_table(r.get("C2", {}).get("bench"), r.get("C4", {}).get("bench"))
     path = run.out / "report.md"
     path.write_text("\n".join(lines) + "\n")
     return path
+
+
+def bench_table(fa: dict | None, qsa: dict | None) -> list[str]:
+    if not fa and not qsa:
+        return []
+    fa, qsa = fa or {}, qsa or {}
+    lines = [
+        "",
+        f"性能（{BENCH}，不含 PLE 的开销）",
+        "",
+        "| 指标 | fa | qsa_sparse |",
+        "| --- | --- | --- |",
+    ]
+    for k in dict.fromkeys([*fa, *qsa]):
+        lines += [f"| {k} | {fa.get(k, '-')} | {qsa.get(k, '-')} |"]
+    return lines
 
 
 def main() -> int:
