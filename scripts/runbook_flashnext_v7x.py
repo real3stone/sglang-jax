@@ -421,6 +421,7 @@ def run_needles(run: Run, srv: Server, needles=NEEDLES) -> list[dict]:
             "found": code in text,
             "after_think": code in answer,
             "output": text,
+            "token_ids": g["token_ids"],
         }
         run.log(f"  needle 约 {n} token（实际 {g['prompt_tokens']}）：{needle_status(entry)}")
         out.append(entry)
