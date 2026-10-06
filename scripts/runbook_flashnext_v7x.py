@@ -176,9 +176,22 @@ def git_info(repo: str) -> dict:
     }
 
 
-def server_cmd(args, backend: str) -> list[str]:
+# server_cmd 的默认启动参数；launch 里给出的项覆盖它们
+DEFAULT_LAUNCH = {
+    "ple": False,
+    "context_length": 32768,
+    "max_running_requests": MAX_RUNNING_REQUESTS,
+    "precompile_bs_paddings": (16,),
+    "precompile_token_paddings": (16, 512, 1024),
+}
+
+
+def server_cmd(args, backend: str, launch: dict | None = None) -> list[str]:
     # 预编译档位、跳过 warmup、随机种子照搬仓库的 Qwen3.5 TPU 测试；超过最大档位的
     # batch 会落到自动补上的 max_padded_num_tokens 那一档，不会报错。
+    cfg = {**DEFAULT_LAUNCH, **(launch or {})}
+    ple = [] if cfg["ple"] else ["--json-model-override-args", json.dumps(PLE_OFF)]
+    running = str(cfg["max_running_requests"])
     return [
         sys.executable, "-u", "-m", "sgl_jax.launch_server",
         "--model-path", args.model_path,
@@ -187,19 +200,19 @@ def server_cmd(args, backend: str) -> list[str]:
         "--tp-size", str(args.tp),
         "--ep-size", str(args.tp),
         "--attention-backend", backend,
-        "--json-model-override-args", json.dumps(PLE_OFF),
-        "--context-length", "32768",
+        *ple,
+        "--context-length", str(cfg["context_length"]),
         "--page-size", "64",
         "--chunked-prefill-size", "2048",
         "--mem-fraction-static", "0.8",
-        "--max-running-requests", str(MAX_RUNNING_REQUESTS),
-        "--max-recurrent-state-size", str(MAX_RUNNING_REQUESTS),
+        "--max-running-requests", running,
+        "--max-recurrent-state-size", running,
         "--disable-radix-cache",
         "--disable-overlap-schedule",
         "--skip-server-warmup",
         "--random-seed", "3",
-        "--precompile-bs-paddings", "16",
-        "--precompile-token-paddings", "16", "512", "1024",
+        "--precompile-bs-paddings", *map(str, cfg["precompile_bs_paddings"]),
+        "--precompile-token-paddings", *map(str, cfg["precompile_token_paddings"]),
         "--watchdog-timeout", str(COMPILE_TIMEOUT),
         "--host", "127.0.0.1",
         "--port", str(args.port),
@@ -207,14 +220,16 @@ def server_cmd(args, backend: str) -> list[str]:
 
 
 class Server:
-    def __init__(self, run: Run, args, backend: str):
-        self.run, self.args, self.backend = run, args, backend
+    def __init__(self, run: Run, args, backend: str, launch: dict | None = None, label: str = ""):
+        self.run, self.args, self.backend, self.launch = run, args, backend, launch
+        # 同一个后端启动两次时，label 把日志、压测和 profile 的文件名分开
+        self.label = label or backend
         self.base = f"http://127.0.0.1:{args.port}"
-        self.log_path = run.out / f"server_{backend}.log"
+        self.log_path = run.out / f"server_{self.label}.log"
         self.proc: subprocess.Popen | None = None
 
     def __enter__(self):
-        cmd = server_cmd(self.args, self.backend)
+        cmd = server_cmd(self.args, self.backend, self.launch)
         env = dict(os.environ)
         # 两次启动共用编译缓存，第二次能省掉一部分编译时间
         env.setdefault("JAX_COMPILATION_CACHE_DIR", str(self.run.out / "jit_cache"))
@@ -279,7 +294,9 @@ class Server:
         time.sleep(30)  # 等 TPU 运行时释放芯片，再进行下一次启动
 
 
-def stage_launch(run: Run, args, backend: str, steps) -> None:
+def stage_launch(
+    run: Run, args, backend: str, steps, launch: dict | None = None, label: str = ""
+) -> None:
     """一次服务启动依次跑 ``steps`` = [(阶段, fn(srv, ready, checks))]。
 
     某个阶段出了异常只记在它自己身上，服务还活着就接着跑下一个；服务退出了或者
@@ -287,7 +304,7 @@ def stage_launch(run: Run, args, backend: str, steps) -> None:
     """
     pending = [stage for stage, _ in steps]
     try:
-        with Server(run, args, backend) as srv:
+        with Server(run, args, backend, launch, label) as srv:
             ready = srv.wait_ready()
             summary = [
                 line.rstrip() for line in open(srv.log_path) if "WeightLoader summary" in line
@@ -322,9 +339,26 @@ def stage_launch(run: Run, args, backend: str, steps) -> None:
 # ---- C0 -----------------------------------------------------------------------
 
 
-def stage_c0(run: Run, args) -> bool:
-    run.log(f"===== C0：{STAGE_INFO['C0']}")
+def host_mem_available_gib() -> float | None:
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.exists():
+        return None
+    for line in meminfo.read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 2**20
+    return None
+
+
+def stage_c0(run: Run, args, stage: str = "C0", min_mem_gib: float | None = None) -> bool:
+    run.log(f"===== {stage}：{STAGE_INFO[stage]}")
     problems = []
+    mem_gib = host_mem_available_gib()
+    if min_mem_gib is not None and (mem_gib is None or mem_gib < min_mem_gib):
+        have = "读不到" if mem_gib is None else f"{mem_gib:.0f} GiB"
+        problems.append(
+            f"主机可用内存 {have}，至少要 {min_mem_gib:.0f} GiB："
+            "n-gram 表（95.4 GiB）常驻主机内存，还要留出余量"
+        )
     pkg = Path(args.repo, "python", "sgl_jax")
     if not pkg.is_dir():
         problems.append(
@@ -378,10 +412,11 @@ def stage_c0(run: Run, args) -> bool:
     for p in problems:
         run.log(f"  问题：{p}")
     run.record(
-        "C0",
+        stage,
         "FAIL" if problems else "PASS",
         problems=problems,
         devices=info,
+        mem_available_gib=None if mem_gib is None else round(mem_gib, 1),
         safetensors_files=n_st,
         disk_free=f"{shutil.disk_usage(model).free / 2**30:.0f} GiB" if model.is_dir() else None,
         repo=repo,
@@ -540,7 +575,7 @@ def compare(ref: list[dict], got: list[dict]) -> dict:
 
 
 def run_bench(run: Run, srv: Server, args, bench: dict = BENCH, tag: str = "") -> dict:
-    out_file = run.out / f"bench_serving_{srv.backend}{tag}.jsonl"
+    out_file = run.out / f"bench_serving_{srv.label}{tag}.jsonl"
     out_file.unlink(missing_ok=True)
     cmd = [
         sys.executable, "-m", "sgl_jax.bench_serving",
@@ -557,7 +592,7 @@ def run_bench(run: Run, srv: Server, args, bench: dict = BENCH, tag: str = "") -
         "--output-file", str(out_file),
     ]  # fmt: skip
     run.log(f"  bench_serving：{shlex.join(cmd)}")
-    log = run.out / f"bench_serving_{srv.backend}{tag}.log"
+    log = run.out / f"bench_serving_{srv.label}{tag}.log"
     with open(log, "w") as f:
         r = subprocess.run(cmd, cwd=args.repo, stdout=f, stderr=subprocess.STDOUT, check=False)
     if r.returncode != 0 or not out_file.exists():
