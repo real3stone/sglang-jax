@@ -366,8 +366,9 @@ def main() -> int:
             print(shlex.join(rb.server_cmd(args, backend)), end="\n\n")
         return 0
 
-    # SSH 断开时照 Ctrl-C 处理：先停掉服务，再写报告、打包
+    # SSH 断开或被 kill 时照 Ctrl-C 处理：先停掉服务，再写报告、打包
     signal.signal(signal.SIGHUP, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     run = rb.Run(Path(args.out))
     stages = {s.strip().upper() for s in args.stages.split(",")}
     # 重跑 fa 那次时，F2 的判定用的是旧的 fa 结果，一起清掉
