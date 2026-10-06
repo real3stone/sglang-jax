@@ -158,17 +158,19 @@ def _draft_decode_tree_mask(context_lens, parents_by_step, topk: int, width: int
     return mask.astype(jnp.int32).reshape(bs * topk, 1, width)
 
 
-def _draft_decode_kv_lens(seq_lens, speculative_step_id: int, topk: int) -> np.ndarray:
+def _draft_decode_kv_lens(seq_lens, speculative_step_id: int, topk: int):
     """KV length of each slot at one EAGLE draft-decode step; 0 for padding slots.
 
     The draft context ends at ``seq_lens - 1``, and every step appends one
     ``topk``-wide block of sibling tokens behind it, so step ``i`` attends over
     ``seq_lens - 1 + (i + 1) * topk`` positions and writes its block to the
     last ``topk`` of them. The attention kv_lens, the page window and the tree
-    mask row width all come from this one expression.
+    mask row width all come from this one expression. A ``jax.Array`` input
+    gives a ``jax.Array``, anything else a NumPy array.
     """
-    seq_lens = np.asarray(seq_lens)
-    return np.where(seq_lens > 0, seq_lens - 1 + (speculative_step_id + 1) * topk, 0)
+    xp = jnp if isinstance(seq_lens, jax.Array) else np
+    seq_lens = xp.asarray(seq_lens)
+    return xp.where(seq_lens > 0, seq_lens - 1 + (speculative_step_id + 1) * topk, 0)
 
 
 def _pad_page_indices(

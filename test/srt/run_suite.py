@@ -293,6 +293,11 @@ suites = {
             runner="pytest",
         ),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 0.2),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_eagle_tree_fused_round.py",
+            1,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 0.5),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 0.1),
@@ -431,6 +436,16 @@ suites = {
         TestFile(
             "python/sgl_jax/test/speculative/test_eagle_accept_path.py",
             0.2,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_eagle_tree_fused.py",
+            0.3,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_eagle_tree_fused_round.py",
+            0.5,
             runner="pytest",
         ),
         TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),

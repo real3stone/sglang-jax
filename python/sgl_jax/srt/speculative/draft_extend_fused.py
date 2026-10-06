@@ -50,6 +50,15 @@ class GreedySampleAndPrepareOutput(NamedTuple):
     predict: jax.Array
 
 
+class EagleTreeVerifyResult(NamedTuple):
+    accept_lens: jax.Array
+    accept_index: jax.Array
+    output_ids: jax.Array
+    verified_id: jax.Array
+    hidden_states: jax.Array
+    positions: jax.Array
+
+
 class FusedDraftExtendPendingResult(NamedTuple):
     batch_output: object
     selected_layer0_hidden: object
@@ -911,6 +920,121 @@ def _make_eagle3_decode_metadata(
     )
 
 
+def _make_eagle3_tree_draft_metadata(
+    old_metadata,
+    seq_lens,
+    allocated_lens,
+    parents_by_step,
+    *,
+    step: int,
+    topk: int,
+    width: int,
+    page_size: int,
+    dp_size: int,
+):
+    """Build one EAGLE3 tree draft-decode step's metadata on device.
+
+    Every slot feeds ``topk`` sibling rows. ``parents_by_step[s - 1]`` is the
+    parent array ``select_top_k_tokens`` produced at step ``s``; the tree mask
+    lets each row see the slot's context and its own ancestors only.
+    """
+    from sgl_jax.srt.layers.attention.flashattention_backend import (
+        FlashAttentionMetadata,
+        _draft_decode_kv_lens,
+        _draft_decode_tree_mask,
+    )
+
+    kv_lens = _draft_decode_kv_lens(seq_lens, step, topk)
+    valid = seq_lens > 0
+    total_bs = seq_lens.shape[0]
+    per_dp_bs = total_bs // dp_size
+    local_cu_q_lens = jnp.arange(0, per_dp_bs * topk + 1, topk, dtype=jnp.int32)
+    cu_q_lens = jnp.tile(local_cu_q_lens, dp_size)
+    aligned_kv_lens = ((kv_lens + page_size - 1) // page_size) * page_size
+    cu_kv_lens = _per_dp_cumsum_device(aligned_kv_lens, dp_size)
+    page_indices = _repack_page_indices(
+        old_metadata.page_indices,
+        allocated_lens,
+        kv_lens,
+        page_size=page_size,
+        dp_size=dp_size,
+    )
+
+    valid_rows = _reshape_per_dp_rows(valid, dp_size)
+    local_num_seqs = jnp.sum(valid_rows.astype(jnp.int32), axis=1)
+    distribution = jnp.stack(
+        [jnp.zeros_like(local_num_seqs), jnp.zeros_like(local_num_seqs), local_num_seqs],
+        axis=1,
+    ).reshape((dp_size * 3,))
+
+    context_lens = jax.sharding.reshard(jnp.where(valid, seq_lens - 1, -1).astype(jnp.int32), P())
+    custom_mask = _draft_decode_tree_mask(
+        context_lens,
+        tuple(jax.sharding.reshard(parents, P()) for parents in parents_by_step),
+        topk=topk,
+        width=width,
+    )
+
+    data_sharding = jax.typeof(seq_lens).sharding
+    if isinstance(data_sharding, NamedSharding) and not data_sharding.mesh.empty:
+        cu_q_lens = jax.sharding.reshard(cu_q_lens, data_sharding)
+        cu_kv_lens = jax.sharding.reshard(cu_kv_lens, data_sharding)
+        page_indices = jax.sharding.reshard(page_indices, data_sharding)
+        kv_lens = jax.sharding.reshard(kv_lens, data_sharding)
+        distribution = jax.sharding.reshard(distribution, data_sharding)
+        custom_mask = jax.sharding.reshard(
+            custom_mask, NamedSharding(data_sharding.mesh, P("data"))
+        )
+
+    return FlashAttentionMetadata(
+        cu_q_lens=cu_q_lens,
+        cu_kv_lens=cu_kv_lens,
+        page_indices=page_indices,
+        swa_page_indices=None,
+        seq_lens=kv_lens,
+        distribution=distribution,
+        custom_mask=custom_mask,
+    )
+
+
+def _make_eagle3_tree_verify_metadata(
+    old_metadata,
+    verify_seq_lens,
+    allocated_lens,
+    tree_mask,
+    *,
+    num_draft_tokens: int,
+    width: int,
+    page_size: int,
+):
+    """Build dp=1 tree verify metadata on device.
+
+    ``tree_mask`` is the tree builder's ``QLEN_ONLY`` output, one
+    ``num_draft_tokens``-square block per slot; it is laid out behind each
+    slot's context as the kernel's ``[rows, 1, width]`` rectangle.
+    """
+    from sgl_jax.srt.layers.attention.flashattention_backend import (
+        _expand_verify_tree_mask,
+    )
+
+    metadata = _make_target_verify_metadata(
+        old_metadata,
+        verify_seq_lens,
+        allocated_lens,
+        speculative_num_draft_tokens=num_draft_tokens,
+        page_size=page_size,
+        dp_size=1,
+    )
+    context_lens = jnp.where(verify_seq_lens > 0, verify_seq_lens, -1).astype(jnp.int32)
+    mask = _expand_verify_tree_mask(
+        tree_mask,
+        jax.sharding.reshard(context_lens, P()),
+        draft_token_num=num_draft_tokens,
+        width=width,
+    )
+    return replace(metadata, custom_mask=jax.sharding.reshard(mask, P("data")))
+
+
 def _eagle3_raw_and_mapped_token_from_logits(logits, hot_token_ids):
     raw_token = argmax_with_dp_sharding(logits)
     if hot_token_ids is None:
@@ -1373,6 +1497,213 @@ def _build_verify(topk: int):
         )
 
     return fused_verify
+
+
+def _build_eagle3_tree_verify(num_steps: int, topk: int, num_draft_tokens: int):
+    """Build EAGLE3 tree drafting, tree build and target verify as one JIT.
+
+    The draft starts from the previous round's seeds (``topk_p``,
+    ``topk_index``, ``hidden_states``, ``verified_id``). Target KV of each
+    accepted path is moved to the front of its verify window before return.
+    """
+    assert topk > 1, "Fused EAGLE3 tree verify needs topk > 1"
+    assert num_steps > 1, "Fused EAGLE3 tree verify needs num_steps > 1"
+
+    from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
+        QLEN_ONLY,
+    )
+    from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import (
+        verify_tree_greedy,
+    )
+    from sgl_jax.srt.mem_cache.memory_pool import copy_kv_rows_in_jit
+    from sgl_jax.srt.speculative.eagle_draft_worker import (
+        select_top_k_tokens,
+        topk_probs_from_logits,
+        update_eagle_lists,
+    )
+    from sgl_jax.srt.speculative.eagle_util import (
+        accepted_path_kv_copies_device,
+        build_tree_kernel_efficient_device,
+        front_pack_accepted_tokens_device,
+    )
+
+    accept_width = num_steps + 1
+    n = num_draft_tokens
+
+    @partial(
+        jax.jit,
+        donate_argnames=["target_memory_pools", "draft_memory_pools"],
+        static_argnames=["target_model_state_def", "draft_model_state_def", "width"],
+    )
+    def fused_eagle3_tree_verify(
+        target_model_def,
+        target_model_state_def,
+        target_leaves,
+        target_forward_batch,
+        target_memory_pools,
+        target_logits_metadata,
+        draft_model_def,
+        draft_model_state_def,
+        draft_leaves,
+        draft_forward_batch,
+        draft_memory_pools,
+        draft_logits_metadata,
+        topk_p,
+        topk_index,
+        hidden_states,
+        verified_id,
+        seq_lens,
+        allocate_lens,
+        hot_token_ids,
+        *,
+        width,
+    ):
+        bs = seq_lens.shape[0]
+        page_size = target_forward_batch.attn_backend.page_size
+        if hot_token_ids is not None:
+            topk_index = _map_eagle3_token_ids(topk_index, hot_token_ids)
+
+        draft_state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_leaves)
+        draft_model = nnx.merge(draft_model_def, draft_state)
+        draft_base_metadata = draft_forward_batch.attn_backend.forward_metadata
+        positions_base = jnp.repeat(jax.sharding.reshard(seq_lens, P()), topk)
+        score_list = jnp.zeros((bs, 1 + (num_steps - 1) * topk, topk), dtype=jnp.float32)
+        token_list = jnp.zeros((bs, topk + (num_steps - 1) * topk * topk), dtype=jnp.int32)
+        parents_list = jnp.zeros((bs, topk + 1 + (num_steps - 1) * topk), dtype=jnp.int32)
+        scores = None
+        later_parents = []
+        draft_pool_updates = None
+        for step in range(num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                step, topk_p, topk_index, hidden_states, scores, topk
+            )
+            score_list, token_list, parents_list = update_eagle_lists(
+                step, score_list, token_list, parents_list, tree_info, topk
+            )
+            if step == num_steps - 1:
+                break
+            if step > 0:
+                later_parents.append(tree_info[2])
+            draft_forward_batch.input_ids = input_ids
+            draft_forward_batch.positions = positions_base + step
+            draft_forward_batch.spec_info.hidden_states = hidden_states
+            draft_forward_batch.attn_backend.forward_metadata = _make_eagle3_tree_draft_metadata(
+                draft_base_metadata,
+                seq_lens,
+                allocate_lens,
+                tuple(later_parents),
+                step=step,
+                topk=topk,
+                width=width,
+                page_size=page_size,
+                dp_size=1,
+            )
+            draft_output, draft_pool_updates, _, _ = draft_model(
+                draft_forward_batch, draft_memory_pools, draft_logits_metadata
+            )
+            draft_memory_pools.replace_all(draft_pool_updates)
+            topk_p, topk_index = topk_probs_from_logits(draft_output.next_token_logits, topk)
+            if hot_token_ids is not None:
+                topk_index = _map_eagle3_token_ids(topk_index, hot_token_ids)
+            hidden_states = jax.sharding.reshard(draft_output.hidden_states, P())
+
+        verified_seq_lens = jax.sharding.reshard(seq_lens - 1, P())
+        (
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient_device(
+            jax.sharding.reshard(verified_id, P()),
+            score_list,
+            token_list,
+            parents_list,
+            verified_seq_lens,
+            jnp.sum(verified_seq_lens),
+            topk,
+            n,
+            n,
+            bs,
+            num_steps,
+            tree_mask_mode=QLEN_ONLY,
+        )
+
+        verify_seq_lens = target_forward_batch.seq_lens
+        verify_metadata = _make_eagle3_tree_verify_metadata(
+            target_forward_batch.attn_backend.forward_metadata,
+            verify_seq_lens,
+            allocate_lens,
+            tree_mask,
+            num_draft_tokens=n,
+            width=width,
+            page_size=page_size,
+        )
+        target_forward_batch.attn_backend.forward_metadata = verify_metadata
+
+        input_sharding = jax.typeof(target_forward_batch.input_ids).sharding
+        target_forward_batch.input_ids = jax.sharding.reshard(draft_tokens, input_sharding)
+        target_forward_batch.positions = jax.sharding.reshard(positions, input_sharding)
+        target_forward_batch.spec_info.draft_token = draft_tokens
+        target_forward_batch.spec_info.positions = positions
+        target_forward_batch.spec_info.retrive_index = retrive_index
+        target_forward_batch.spec_info.retrive_next_token = retrive_next_token
+        target_forward_batch.spec_info.retrive_next_sibling = retrive_next_sibling
+
+        target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
+        target_model = nnx.merge(target_model_def, target_state)
+        target_output, target_pool_updates, _, _ = target_model(
+            target_forward_batch, target_memory_pools, target_logits_metadata
+        )
+        target_logits = jax.sharding.reshard(target_output.next_token_logits, P())
+        target_hidden = jax.sharding.reshard(target_output.hidden_states, P())
+        accept_index, accept_lens, predict = verify_tree_greedy(
+            speculative_num_steps=num_steps,
+            num_draft_tokens=n,
+            draft_tokens=draft_tokens,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            next_token_logits=target_logits,
+        )
+        accept_lens = accept_lens + 1
+
+        kv_buffers = target_pool_updates["token_to_kv_pool"]
+        src, dst = accepted_path_kv_copies_device(
+            accept_index,
+            jax.sharding.reshard(verify_seq_lens, P()),
+            jax.sharding.reshard(verify_metadata.page_indices, P()),
+            jax.sharding.reshard(verify_metadata.cu_kv_lens, P()),
+            draft_token_num=n,
+            page_size=page_size,
+            num_slots=kv_buffers[0].shape[0] * kv_buffers[0].shape[1],
+        )
+        target_pool_updates["token_to_kv_pool"] = copy_kv_rows_in_jit(
+            kv_buffers,
+            src,
+            dst,
+            target_memory_pools.token_to_kv_pool.kv_sharding.spec,
+        )
+
+        flat_accept_index = accept_index.reshape(-1)
+        req_ids = jnp.arange(bs * accept_width, dtype=jnp.int32) // accept_width
+        safe_index = jnp.where(flat_accept_index >= 0, flat_accept_index, req_ids * n + n - 1)
+        accepted_id = jnp.where(flat_accept_index >= 0, predict.at[safe_index].get(), 0)
+        return (
+            target_pool_updates,
+            draft_pool_updates,
+            EagleTreeVerifyResult(
+                accept_lens=accept_lens,
+                accept_index=accept_index,
+                output_ids=front_pack_accepted_tokens_device(accepted_id, accept_width, n),
+                verified_id=accepted_id,
+                hidden_states=target_hidden.at[safe_index].get(),
+                positions=positions.at[safe_index].get(),
+            ),
+        )
+
+    return fused_eagle3_tree_verify
 
 
 def _build_prefill(num_layers: int, topk: int):
@@ -2569,6 +2900,155 @@ def spec_decode_verify(
         extend_logprob_start_len_per_req=None,
     )
     model_worker_batch.spec_info_padded = next_draft_input
+    return batch_output
+
+
+def _tree_draft_hidden_placeholder(draft_worker, bs: int):
+    cache = getattr(draft_worker, "_tree_draft_hidden_placeholder_cache", None)
+    if cache is None:
+        cache = draft_worker._tree_draft_hidden_placeholder_cache = {}
+    placeholder = cache.get(bs)
+    if placeholder is None:
+        hidden_size = draft_worker.model_config.hidden_size
+        placeholder = jax.device_put(
+            np.zeros((bs * draft_worker.topk, hidden_size), dtype=np.float32),
+            NamedSharding(draft_worker.mesh, P()),
+        )
+        cache[bs] = placeholder
+    return placeholder
+
+
+def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens):
+    """Launch EAGLE3 tree drafting and target verify as one JIT.
+
+    Consumes the draft seeds in ``model_worker_batch.spec_info_padded`` and
+    returns the verify result in the layout ``BaseSpecWorker.verify`` produces,
+    with ``model_worker_batch`` left ready for the draft extend.
+    """
+    from sgl_jax.srt.layers.attention.flashattention_backend import (
+        FlashAttentionMetadata,
+        _draft_decode_kv_lens,
+        _padding_trails,
+        mask_row_width,
+    )
+    from sgl_jax.srt.layers.logits_processor import (
+        LogitsMetadata,
+        LogitsProcessorOutput,
+    )
+    from sgl_jax.srt.managers.scheduler import GenerationBatchResult
+    from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+
+    draft_worker = spec_worker.draft_worker
+    target_mr = spec_worker.target_worker.model_runner
+    draft_mr = draft_worker.draft_model_runner
+    topk = draft_worker.topk
+    num_steps = draft_worker.speculative_num_steps
+    n = draft_worker.speculative_num_draft_tokens
+    page_size = draft_worker.page_size
+    mesh = draft_worker.mesh
+
+    draft_worker.padding_for_decode(model_worker_batch, map_hot_token_ids=False)
+    seeds = model_worker_batch.spec_info_padded
+    seq_lens = np.asarray(model_worker_batch.seq_lens)
+    bs = seq_lens.shape[0]
+    assert _padding_trails(seq_lens, 1, bs), "tree verify padding slots must trail the real slots"
+
+    replicated = NamedSharding(mesh, P())
+    data_sharding = NamedSharding(mesh, P("data"))
+    topk_p, topk_index, hidden_states, verified_id = jax.device_put(
+        (seeds.topk_p, seeds.topk_index, seeds.hidden_states, seeds.verified_id), replicated
+    )
+    seq_lens_device, allocate_lens = jax.device_put(
+        (seq_lens.astype(np.int32), np.asarray(seeds.allocate_lens, dtype=np.int32)),
+        data_sharding,
+    )
+
+    base_metadata = draft_mr.attn_backend.get_eagle_base_metadata(model_worker_batch)
+    draft_mr.attn_backend.forward_metadata = base_metadata
+    draft_forward_batch = _make_forward_batch(model_worker_batch, draft_mr)
+    draft_forward_batch.bid = model_worker_batch.bid
+    draft_forward_batch.spec_info = EagleDraftInput(
+        hidden_states=_tree_draft_hidden_placeholder(draft_worker, bs)
+    )
+    draft_logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, mesh)
+
+    _prepare_verify(draft_worker, model_worker_batch, draft_padding_prepared=True)
+    verify_input = model_worker_batch.spec_info_padded
+    verify_input.allocate_lens = cur_allocate_lens
+    verify_input.prepare_for_verify(model_worker_batch)
+    target_mr.attn_backend.forward_metadata = FlashAttentionMetadata(
+        page_indices=base_metadata.page_indices
+    )
+    target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
+    target_forward_batch.bid = model_worker_batch.bid
+    target_logits_metadata = _prepare_logits_metadata(model_worker_batch, spec_worker.mesh)
+
+    # One mask width serves every draft step and the verify.
+    verify_kv_lens = np.where(seq_lens > 0, seq_lens - 1 + n, 0)
+    draft_kv_lens = _draft_decode_kv_lens(seq_lens, max(num_steps - 2, 0), topk)
+    widest = np.maximum(verify_kv_lens, draft_kv_lens)
+    width = mask_row_width(((widest + page_size - 1) // page_size) * page_size)
+
+    if not hasattr(draft_worker, "_fused_eagle3_tree_verify_jit_fn"):
+        draft_worker._fused_eagle3_tree_verify_jit_fn = _build_eagle3_tree_verify(
+            num_steps=num_steps, topk=topk, num_draft_tokens=n
+        )
+    with jax.set_mesh(mesh), _count_pjit_cpp_cache_miss() as count:
+        target_pool_updates, draft_pool_updates, result = (
+            draft_worker._fused_eagle3_tree_verify_jit_fn(
+                target_mr._model_def,
+                target_mr._model_state_def,
+                tuple(target_mr.model_state_leaves),
+                target_forward_batch,
+                target_mr.memory_pools,
+                target_logits_metadata,
+                draft_mr._model_def,
+                draft_mr._model_state_def,
+                tuple(draft_mr.model_state_leaves),
+                draft_forward_batch,
+                draft_mr.memory_pools,
+                draft_logits_metadata,
+                topk_p,
+                topk_index,
+                hidden_states,
+                verified_id,
+                seq_lens_device,
+                allocate_lens,
+                draft_worker.hot_token_ids,
+                width=width,
+            )
+        )
+        cache_miss_count = count()
+    target_mr.memory_pools.replace_all(target_pool_updates)
+    draft_mr.memory_pools.replace_all(draft_pool_updates)
+
+    next_draft_input = EagleDraftInput(
+        verified_id=result.verified_id,
+        new_seq_lens=None,
+        allocate_lens=cur_allocate_lens,
+        hidden_states=result.hidden_states,
+    )
+    model_worker_batch.positions = result.positions
+    model_worker_batch.spec_info_padded = next_draft_input
+    return GenerationBatchResult(
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=result.hidden_states,
+        ),
+        next_token_ids=result.output_ids,
+        next_draft_input=next_draft_input,
+        accept_lens=result.accept_lens,
+        bid=model_worker_batch.bid,
+        cache_miss_count=cache_miss_count,
+        extend_input_len_per_req=None,
+        extend_logprob_start_len_per_req=None,
+    )
+
+
+def spec_decode_eagle3_tree(spec_worker, model_worker_batch, cur_allocate_lens):
+    """Run one EAGLE3 tree decode round: fused draft and verify, then draft extend."""
+    batch_output = launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens)
+    spec_worker.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
     return batch_output
 
 

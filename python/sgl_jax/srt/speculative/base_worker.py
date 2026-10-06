@@ -21,6 +21,7 @@ from sgl_jax.srt.speculative.eagle_util import (
     front_pack_accepted_tokens,
 )
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
+from sgl_jax.srt.speculative.spec_utils import SIMULATED_ACCEPTANCE_CONFIG
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -129,6 +130,15 @@ class BaseSpecWorker:
                 f"--speculative-eagle-topk > 1 with --page-size > 1 does not support "
                 f"{type(kv_pool).__name__}; use --page-size 1."
             )
+        # The fused tree path moves accepted-path KV rows, which covers the
+        # fused KV buffer only; other pools use the non-fused tree path.
+        self._can_use_fused_eagle3_tree = (
+            self.speculative_algorithm.is_eagle3()
+            and self.topk > 1
+            and self.speculative_num_steps > 1
+            and type(kv_pool) is MHATokenToKVPool
+            and os.getenv("SGL_JAX_DISABLE_FUSED_EAGLE3_TREE") != "1"
+        )
         draft_runner = getattr(draft_worker, "draft_model_runner", None)
         for runner in (target_worker.model_runner, draft_runner):
             if self.topk > 1 and runner is not None and has_row_positioned_attention(runner.model):
@@ -362,6 +372,22 @@ class BaseSpecWorker:
                 model_worker_batch,
                 batch_output,
             )
+            launch_done = getattr(model_worker_batch, "launch_done", None)
+            if launch_done is not None:
+                launch_done.set()
+            return batch_output
+        if (
+            self._can_use_fused_eagle3_tree
+            and model_worker_batch.sampling_info.is_all_greedy
+            and not model_worker_batch.return_logprob
+            and not getattr(model_worker_batch, "return_output_logprob_only", False)
+            and not SIMULATED_ACCEPTANCE_CONFIG.enabled
+        ):
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                spec_decode_eagle3_tree,
+            )
+
+            batch_output = spec_decode_eagle3_tree(self, model_worker_batch, cur_allocate_lens)
             launch_done = getattr(model_worker_batch, "launch_done", None)
             if launch_done is not None:
                 launch_done.set()

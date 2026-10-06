@@ -1420,15 +1420,26 @@ def write_kv_layer(
     )
 
 
-@partial(jax.jit, static_argnames=("kv_spec",), donate_argnums=(0,))
-def _copy_kv_rows(kv_buffers, src, dst, kv_spec):
+def copy_kv_rows_in_jit(kv_buffers, src, dst, kv_spec):
+    """Copy every buffer's KV at token slot ``src[i]`` to slot ``dst[i]``.
+
+    All rows are read before any is written. A ``dst`` past the last slot is
+    skipped.
+    """
     row_spec = P(None, *kv_spec[2:])
     out = []
     for kv in kv_buffers:
         page_size = kv.shape[1]
         rows = kv.at[src // page_size, src % page_size].get(out_sharding=row_spec)
-        out.append(kv.at[dst // page_size, dst % page_size].set(rows, out_sharding=kv_spec))
+        out.append(
+            kv.at[dst // page_size, dst % page_size].set(rows, out_sharding=kv_spec, mode="drop")
+        )
     return out
+
+
+@partial(jax.jit, static_argnames=("kv_spec",), donate_argnums=(0,))
+def _copy_kv_rows(kv_buffers, src, dst, kv_spec):
+    return copy_kv_rows_in_jit(kv_buffers, src, dst, kv_spec)
 
 
 def update_fused_kv_cache(

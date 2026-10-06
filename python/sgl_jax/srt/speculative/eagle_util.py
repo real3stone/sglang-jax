@@ -241,6 +241,41 @@ def build_tree_kernel_efficient(
     verified_id, score_list, token_list, parents_list, seq_lens = jax.device_put(
         (verified_id, score_list, token_list, parents_list, seq_lens), rep
     )
+    with jax.set_mesh(mesh):
+        return build_tree_kernel_efficient_device(
+            verified_id,
+            score_list,
+            token_list,
+            parents_list,
+            seq_lens,
+            seq_lens_sum,
+            topk,
+            num_verify_tokens,
+            max_seq_len_per_req,
+            batch_size,
+            speculative_num_steps,
+            tree_mask_mode=tree_mask_mode,
+        )
+
+
+def build_tree_kernel_efficient_device(
+    verified_id: jax.Array,
+    score_list: jax.Array,
+    token_list: jax.Array,
+    parents_list: jax.Array,
+    seq_lens: jax.Array,
+    seq_lens_sum: jax.Array,
+    topk: int,
+    num_verify_tokens: int,
+    max_seq_len_per_req: int,
+    batch_size: int,
+    speculative_num_steps: int,
+    tree_mask_mode: int = FULL_MASK,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``build_tree_kernel_efficient`` on replicated arrays under the caller's mesh.
+
+    Usable inside a JIT. Returns the same tuple.
+    """
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
         verified_id,
         score_list,
@@ -250,21 +285,18 @@ def build_tree_kernel_efficient(
         batch_size,
         speculative_num_steps,
     )
-
-    with jax.set_mesh(mesh):
-        tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
-            build_eagle_tree_structure(
-                parent_list=parent_list,
-                selected_index=top_scores_index,
-                verified_seq_len=seq_lens,
-                draft_token_num=num_verify_tokens,
-                topk=topk,
-                seq_lens_sum=seq_lens_sum,
-                max_context_len=max_seq_len_per_req,
-                tree_mask_mode=tree_mask_mode,
-            )
+    tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
+        build_eagle_tree_structure(
+            parent_list=parent_list,
+            selected_index=top_scores_index,
+            verified_seq_len=seq_lens,
+            draft_token_num=num_verify_tokens,
+            topk=topk,
+            seq_lens_sum=seq_lens_sum,
+            max_context_len=max_seq_len_per_req,
+            tree_mask_mode=tree_mask_mode,
         )
-
+    )
     return (
         tree_mask,
         positions,
@@ -289,6 +321,17 @@ def front_pack_accepted_tokens(
     width = min(draft_token_num, accept_width)
     packed[:, :width] = verified_id.reshape(bs, accept_width)[:, :width]
     return packed.reshape(-1)
+
+
+def front_pack_accepted_tokens_device(
+    verified_id: jax.Array, accept_width: int, draft_token_num: int
+) -> jax.Array:
+    """Device version of ``front_pack_accepted_tokens``."""
+    bs = verified_id.shape[0] // accept_width
+    width = min(draft_token_num, accept_width)
+    accepted = verified_id.reshape(bs, accept_width)[:, :width]
+    tail = jnp.zeros((bs, draft_token_num - width), dtype=verified_id.dtype)
+    return jnp.concatenate([accepted, tail], axis=1).reshape(-1)
 
 
 def _accepted_nodes(accept_index: np.ndarray, slot: int, draft_token_num: int) -> np.ndarray:
@@ -374,6 +417,41 @@ def accepted_path_kv_copies(
     if not src:
         return np.empty(0, np.int32), np.empty(0, np.int32)
     return np.concatenate(src).astype(np.int32), np.concatenate(dst).astype(np.int32)
+
+
+def accepted_path_kv_copies_device(
+    accept_index: jax.Array,
+    window_starts: jax.Array,
+    page_indices: jax.Array,
+    cu_kv_lens: jax.Array,
+    *,
+    draft_token_num: int,
+    page_size: int,
+    num_slots: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Device version of ``accepted_path_kv_copies`` over a verify page table.
+
+    Slot ``s``'s logical position ``p`` lives on page
+    ``page_indices[cu_kv_lens[s] // page_size + p // page_size]``, the layout
+    the verify attention reads. Returns one ``(src, dst)`` pair per entry of
+    ``accept_index``; a pair whose node already sits at its path position has
+    ``dst == num_slots``, past the last slot, so a dropping scatter skips it.
+    """
+    bs, accept_width = accept_index.shape
+    node = accept_index - jnp.arange(bs, dtype=jnp.int32)[:, None] * draft_token_num
+    depth = jnp.arange(accept_width, dtype=jnp.int32)[None, :]
+    moved = (accept_index >= 0) & (node != depth)
+    page_base = (cu_kv_lens[:bs] // page_size)[:, None]
+    starts = window_starts[:, None]
+
+    def slot(offset):
+        pos = starts + offset
+        page = page_indices.at[page_base + pos // page_size].get(mode="fill", fill_value=0)
+        return page * page_size + pos % page_size
+
+    src = slot(jnp.where(moved, node, 0))
+    dst = jnp.where(moved, slot(depth), num_slots)
+    return src.reshape(-1).astype(jnp.int32), dst.reshape(-1).astype(jnp.int32)
 
 
 def assign_req_to_token_pool(
