@@ -92,7 +92,7 @@ STAGE_INFO = {
 EXPECTED_DEVICES = 8
 EXPECTED_SAFETENSORS = 131
 # 这份 runbook 对应的代码版本，C0 要求代码至少包含这个提交
-REQUIRED_COMMIT = "5523ae53"
+REQUIRED_COMMIT = "5dcf8188"
 # consumed = 映射上并加载的张量；skipped = 视觉 333 + MTP 31 + N-gram 137。
 EXPECTED_LOAD_SUMMARY = "consumed=1157, skipped=501, missing=0, unexpected=0"
 PLE_OFF = {"text_config": {"ple_layer_ids": []}}
