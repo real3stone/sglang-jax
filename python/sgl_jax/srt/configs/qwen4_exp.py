@@ -334,6 +334,12 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
         return self.hidden_size * self.hc_count, state_len
 
     @property
+    def ple_embeddings_width(self) -> int:
+        """Width of the table rows each token carries into the N-gram layer,
+        0 when no layer has one."""
+        return int(self.ple_embed_dim) if self.ple_layer_ids else 0
+
+    @property
     def linear_state_params(self):
         """The recurrent (temporal) state RecurrentStatePool holds per request."""
         from sgl_jax.srt.mem_cache.recurrent_state_pool import (
