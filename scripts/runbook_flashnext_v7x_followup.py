@@ -136,15 +136,17 @@ def http(srv: rb.Server, path: str, payload: dict | None = None) -> str:
         return r.read().decode()
 
 
-def capture_profile(run: rb.Run, srv: rb.Server, args) -> dict:
+def capture_profile(
+    run: rb.Run, srv: rb.Server, args, request: dict = PROFILE_REQUEST, load: dict = PROFILE_LOAD
+) -> dict:
     """在预热好的服务上抓 prefill、decode 各几步的 profile。
 
     按阶段抓取时，服务端在阶段切换或者凑够步数时自己停；等它回到 idle，没回去就手动停。
     """
-    out = run.out / f"profile_{srv.backend}"
+    out = run.out / f"profile_{srv.label}"
     shutil.rmtree(out, ignore_errors=True)
-    http(srv, "/start_profile", {**PROFILE_REQUEST, "output_dir": str(out.resolve())})
-    rb.run_bench(run, srv, args, PROFILE_LOAD, tag="_profile")
+    http(srv, "/start_profile", {**request, "output_dir": str(out.resolve())})
+    rb.run_bench(run, srv, args, load, tag="_profile")
     deadline = time.time() + PROFILE_WAIT_SECONDS
     while json.loads(http(srv, "/profile_status"))["status"] != "idle":
         if time.time() > deadline:
