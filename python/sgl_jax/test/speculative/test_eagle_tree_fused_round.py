@@ -11,6 +11,7 @@ Pallas kernels run in interpret mode.
 
 import json
 from functools import partial
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -387,6 +388,7 @@ def test_fused_rounds_match_per_step_path(
     tmp_path, off_tpu_kernels, monkeypatch, page_size, topk, steps, num_draft_tokens
 ):
     harness = _Harness(tmp_path, page_size, topk, steps, num_draft_tokens)
+    assert harness.spec_worker._can_use_fused_eagle3_tree
 
     moves = []
     move_paths = BaseSpecWorker._move_accepted_paths_to_front
@@ -397,14 +399,19 @@ def test_fused_rounds_match_per_step_path(
         return move_paths(self, model_worker_batch, accept_index)
 
     monkeypatch.setattr(BaseSpecWorker, "_move_accepted_paths_to_front", record_moves)
-    fused_rounds = []
-    launch = draft_extend_fused.launch_eagle3_tree_verify
+    launches = []
 
-    def record_launch(*args, **kwargs):
-        fused_rounds.append(1)
-        return launch(*args, **kwargs)
+    def recorded(name):
+        launch = getattr(draft_extend_fused, name)
 
-    monkeypatch.setattr(draft_extend_fused, "launch_eagle3_tree_verify", record_launch)
+        def record(*args, **kwargs):
+            launches.append(name)
+            return launch(*args, **kwargs)
+
+        return record
+
+    for name in ("launch_eagle3_tree_verify", "launch_eagle3_tree_draft_extend"):
+        monkeypatch.setattr(draft_extend_fused, name, recorded(name))
     # The draft lists the tree is built from carry every draft step's scores,
     # so they expose draft-step errors that leave the chosen tree unchanged.
     trees = []
@@ -447,6 +454,26 @@ def test_fused_rounds_match_per_step_path(
         seq_lens = seq_lens + legacy["accept"]
         seeds, snapshot = legacy["seeds"], legacy["snapshot"]
 
-    assert len(fused_rounds) == 4
+    assert launches == ["launch_eagle3_tree_verify", "launch_eagle3_tree_draft_extend"] * 4
     assert len(trees) == 8
     assert sum(moves) > 0, "no round moved an accepted path; the KV copy went untested"
+
+
+@pytest.mark.parametrize(
+    "changes, expected",
+    [
+        ({}, True),
+        ({"is_all_greedy": False}, False),
+        ({"return_logprob": True}, False),
+        ({"return_output_logprob_only": True}, False),
+        ({"can_use": False}, False),
+    ],
+)
+def test_rounds_outside_the_fused_path_take_the_per_step_path(changes, expected):
+    worker = SimpleNamespace(_can_use_fused_eagle3_tree=changes.get("can_use", True))
+    batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(is_all_greedy=changes.get("is_all_greedy", True)),
+        return_logprob=changes.get("return_logprob", False),
+        return_output_logprob_only=changes.get("return_output_logprob_only", False),
+    )
+    assert BaseSpecWorker._use_fused_eagle3_tree(worker, batch) is expected

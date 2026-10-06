@@ -376,13 +376,7 @@ class BaseSpecWorker:
             if launch_done is not None:
                 launch_done.set()
             return batch_output
-        if (
-            self._can_use_fused_eagle3_tree
-            and model_worker_batch.sampling_info.is_all_greedy
-            and not model_worker_batch.return_logprob
-            and not getattr(model_worker_batch, "return_output_logprob_only", False)
-            and not SIMULATED_ACCEPTANCE_CONFIG.enabled
-        ):
+        if self._use_fused_eagle3_tree(model_worker_batch):
             from sgl_jax.srt.speculative.draft_extend_fused import (
                 spec_decode_eagle3_tree,
             )
@@ -399,6 +393,20 @@ class BaseSpecWorker:
         if launch_done is not None:
             launch_done.set()
         return batch_output
+
+    def _use_fused_eagle3_tree(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        """Whether this decode round can run on the fused tree path.
+
+        The per-step tree path keeps the same draft state, so any round may
+        take either path.
+        """
+        return (
+            self._can_use_fused_eagle3_tree
+            and model_worker_batch.sampling_info.is_all_greedy
+            and not model_worker_batch.return_logprob
+            and not getattr(model_worker_batch, "return_output_logprob_only", False)
+            and not SIMULATED_ACCEPTANCE_CONFIG.enabled
+        )
 
     def forward_target_extend(
         self,
