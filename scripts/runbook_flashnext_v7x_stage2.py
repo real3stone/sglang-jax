@@ -22,7 +22,7 @@
       临时写进工作区的 tuned_block_configs.py，git diff 存成 p3_tuned_configs.diff。
 
   Part 2：两次启动。
-  S1  PLE 打开启动（上下文 67584、64 个请求）：加载摘要逐字等于
+  S1  PLE 打开启动（上下文 69632、64 个请求）：加载摘要逐字等于
       "consumed=1163, skipped=495, missing=0, unexpected=0"，日志里有 "N-gram table: 128/128 shards"，
       哈希校验没有被跳过；P3 写进了条目时，日志里要有 "Using tuned block config"；再发一个请求，
       能正常出 token、logprob 里没有 NaN。
@@ -143,7 +143,8 @@ TUNED_CONFIGS_FILE = "python/sgl_jax/srt/kernels/fused_moe/v1/tuned_block_config
 
 LAUNCH_PLE_ON = {
     "ple": True,
-    "context_length": 65536 + 2048,  # GPQA 的输出上限 64k，再给题目留 2048
+    # GPQA 的输出上限 64k，再给题目留 4096（最长的一道题套上 chat template 是 2841 token）
+    "context_length": 65536 + 4096,
     "max_running_requests": 64,
     "precompile_bs_paddings": (16, 64),
     "precompile_token_paddings": (16, 64, 512, 1024),
@@ -188,7 +189,6 @@ PERF_BASELINE = {
 EVAL_RETRIES = 5  # 400 和超时以外的错误最多重试这么多次，不无限退避
 # 一个 64k token 的回答在 bs 64 下要一个多小时；超时就记下来，不重发（重发等于从头再生成一遍）
 EVAL_REQUEST_TIMEOUT = 6 * 3600
-EVAL_POLL_SECONDS = 60
 
 PROFILE_DECODE = {**fu.PROFILE_REQUEST, "profile_stages": ["decode"]}
 
@@ -196,33 +196,6 @@ RANK = {"PASS": 0, "WARN": 1, "FAIL": 2}
 
 
 # ---- 子进程 -------------------------------------------------------------------
-
-
-def run_logged(args, cmd, log: Path, srv=None, timeout: float | None = None) -> int:
-    """在仓库根目录跑一条命令，输出写进 log。
-
-    srv 给出时每分钟看一次服务进程，服务退出就杀掉命令并抛异常；timeout 到了也杀掉，返回 -9。
-    """
-    deadline = None if timeout is None else time.time() + timeout
-    with open(log, "w") as f:
-        proc = subprocess.Popen(
-            cmd, cwd=args.repo, stdout=f, stderr=subprocess.STDOUT, start_new_session=True
-        )
-        try:
-            while True:
-                try:
-                    return proc.wait(timeout=EVAL_POLL_SECONDS)
-                except subprocess.TimeoutExpired:
-                    if srv is not None and not srv.alive():
-                        raise RuntimeError(
-                            f"服务进程已退出（返回码 {srv.proc.returncode}），请查看 {srv.log_path}"
-                        )
-                    if deadline is not None and time.time() > deadline:
-                        return -9
-        finally:
-            if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
 
 
 def run_worker(run, args, kind: str, spec: dict, name: str, srv=None, timeout=None) -> dict:
@@ -236,7 +209,7 @@ def run_worker(run, args, kind: str, spec: dict, name: str, srv=None, timeout=No
         "result": str(result.resolve()),
     }
     cmd = [sys.executable, str(Path(__file__).resolve()), "--_worker", kind, json.dumps(spec)]
-    rc = run_logged(args, cmd, run.out / f"{name}.log", srv=srv, timeout=timeout)
+    rc = rb.run_logged(args, cmd, run.out / f"{name}.log", srv=srv, timeout=timeout)
     if rc != 0 or not result.exists():
         return {"error": f"返回码 {rc}，请查看 {name}.log"}
     return json.loads(result.read_text())
@@ -452,7 +425,7 @@ def stage_p1(run: rb.Run, args) -> None:
     run.log(f"===== P1：{STAGE_INFO['P1']}")
     rb.git(args.repo, "checkout", "HEAD", "--", QSA_KERNEL)  # 从仓库里的版本开始测
     parity = [sys.executable, QSA_PARITY_TEST]
-    rc = run_logged(args, parity, run.out / "p1_qsa_parity.log", timeout=QSA_TIMEOUT)
+    rc = rb.run_logged(args, parity, run.out / "p1_qsa_parity.log", timeout=QSA_TIMEOUT)
     run.log(f"  parity 测试：返回码 {rc}")
     bench = run_worker(run, args, "qsa-bench", {}, "p1_qsa_bench", timeout=QSA_TIMEOUT)
     for row in bench.get("rows", []):
@@ -468,7 +441,7 @@ def stage_p1(run: rb.Run, args) -> None:
     )
     restored = rb.git(args.repo, "checkout", QSA_KERNEL_FALLBACK, "--", QSA_KERNEL).returncode == 0
     if restored:
-        rc_fallback = run_logged(
+        rc_fallback = rb.run_logged(
             args, parity, run.out / "p1_qsa_parity_fallback.log", timeout=QSA_TIMEOUT
         )
         after = f"已把工作区的 sparse_gqa_attention.py 还原成 {QSA_KERNEL_FALLBACK} 的版本，" + (
@@ -493,7 +466,7 @@ def stage_p1(run: rb.Run, args) -> None:
 def stage_p2(run: rb.Run, args) -> None:
     run.log(f"===== P2：{STAGE_INFO['P2']}")
     log = run.out / "p2_moe_tune.log"
-    rc = run_logged(args, [sys.executable, *MOE_TUNE_ARGS], log, timeout=MOE_TUNE_TIMEOUT)
+    rc = rb.run_logged(args, [sys.executable, *MOE_TUNE_ARGS], log, timeout=MOE_TUNE_TIMEOUT)
     parsed = [
         {
             "device": m["device"],
@@ -601,8 +574,8 @@ def run_eval_job(run, srv, args, name: str, job: dict, seed: int) -> dict:
     spec = {**job, "seed": seed, "base_url": srv.base, "model": args.model_path}
     run.log(f"  {job['eval']}（{srv.label}，seed {seed}）：{job['num_examples'] or '全部'} 道题")
     res = run_worker(run, args, "eval", spec, name, srv=srv)
-    if not srv.alive():  # 评测刚结束服务就退出了：最后一批请求的结果不可信
-        raise RuntimeError(f"服务进程已退出（返回码 {srv.proc.returncode}），请查看 {srv.log_path}")
+    if reason := srv.dead_reason():  # 评测刚结束服务就退出了：最后一批请求的结果不可信
+        raise RuntimeError(reason)
     run.log(f"  {job['eval']} 得分：{res.get('score', res.get('error'))}")
     if res.get("errors"):
         run.log(
@@ -711,12 +684,12 @@ def stage_ple_on(run: rb.Run, args, wanted: set[str]) -> None:
         clean = (
             scores and len(scores) == len(runs) and not any(r.get("errors") for r in runs.values())
         )
-        run.record("S3", "PASS" if clean else "WARN", **summary)
+        run.record("S3", "PASS" if clean else "WARN" if scores else "FAIL", **summary)
 
     def s4(srv, ready, checks):
         profile = fu.PROFILE_REQUEST if args.profile_prefill else PROFILE_DECODE
         perf, errors = measure_perf(run, srv, args, profile)
-        run.record("S4", "WARN" if errors else "PASS", **perf)
+        run.record("S4", "FAIL" if not perf["bench"] else "WARN" if errors else "PASS", **perf)
 
     steps = [(s, fn) for s, fn in (("S1", s1), ("S2", s2), ("S3", s3), ("S4", s4)) if s in wanted]
     rb.stage_launch(run, args, "qsa_sparse", steps, LAUNCH_PLE_ON, "ple_on")
@@ -737,9 +710,10 @@ def stage_ple_off(run: rb.Run, args) -> None:
             errors.append(f"MMLU：{mmlu.get('error')}")
         elif mmlu.get("errors"):
             errors.append(f"MMLU：{mmlu['errors']} 个请求出错")
+        nothing = not perf["bench"] and "score" not in mmlu
         run.record(
             "S5",
-            "WARN" if errors else "PASS",
+            "FAIL" if nothing else "WARN" if errors else "PASS",
             **perf,
             mmlu=mmlu,
             load_summary=checks["load_summary"],
@@ -930,8 +904,9 @@ def main() -> int:
         print(f"# P2\n{shlex.join([sys.executable, *MOE_TUNE_ARGS])}")
         return 0
 
-    # SSH 断开时照 Ctrl-C 处理：先停掉服务，再写报告、打包
+    # SSH 断开或被 kill 时照 Ctrl-C 处理：先停掉服务，再写报告、打包
     signal.signal(signal.SIGHUP, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     run = rb.Run(Path(args.out))
     stages = {s.strip().upper() for s in args.stages.split(",")}
     for s in stages - {"S3"}:  # S3 按 seed 落盘，断点重跑时保留没重跑的 seed

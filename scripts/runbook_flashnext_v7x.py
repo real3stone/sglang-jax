@@ -79,6 +79,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import psutil
+
 STAGES = ("C0", "C1", "C2", "C3", "C4")
 NOT_RUN = "未运行"
 STAGE_INFO = {
@@ -227,6 +229,7 @@ class Server:
         self.base = f"http://127.0.0.1:{args.port}"
         self.log_path = run.out / f"server_{self.label}.log"
         self.proc: subprocess.Popen | None = None
+        self.children: list[psutil.Process] = []
 
     def __enter__(self):
         cmd = server_cmd(self.args, self.backend, self.launch)
@@ -234,6 +237,11 @@ class Server:
         # 两次启动共用编译缓存，第二次能省掉一部分编译时间
         env.setdefault("JAX_COMPILATION_CACHE_DIR", str(self.run.out / "jit_cache"))
         self.run.log(f"启动服务（{self.backend}）：{shlex.join(cmd)}")
+        if self.log_path.exists():  # 只重跑部分阶段时，留下上一次启动的日志
+            n = 1
+            while self.log_path.with_suffix(f".{n}.log").exists():
+                n += 1
+            self.log_path.rename(self.log_path.with_suffix(f".{n}.log"))
         self.proc = subprocess.Popen(
             cmd,
             cwd=self.args.repo,
@@ -244,18 +252,32 @@ class Server:
         )
         return self
 
+    def dead_reason(self) -> str | None:
+        """服务还在跑时返回 None，否则返回原因。"""
+        if self.proc.poll() is not None:
+            return f"服务进程已退出（返回码 {self.proc.returncode}），请查看 {self.log_path}"
+        for child in self.children:
+            try:
+                if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                    continue
+            except psutil.NoSuchProcess:
+                pass
+            return f"服务的子进程 {child.pid} 已退出，请查看 {self.log_path}"
+        return None
+
     def alive(self) -> bool:
-        return self.proc.poll() is None
+        return self.dead_reason() is None
 
     def wait_ready(self) -> float:
         t0 = time.time()
         while time.time() - t0 < self.args.start_timeout:
-            if not self.alive():
-                raise RuntimeError(
-                    f"服务进程已退出（返回码 {self.proc.returncode}），请查看 {self.log_path}"
-                )
+            if reason := self.dead_reason():
+                raise RuntimeError(reason)
             try:
                 urllib.request.urlopen(f"{self.base}/health", timeout=10)
+                # scheduler、detokenizer 子进程被信号杀掉时，launch_server 只打一行警告、
+                # 自己不退出，所以要连同子进程一起看
+                self.children = psutil.Process(self.proc.pid).children()
                 return time.time() - t0
             except (urllib.error.URLError, ConnectionError, TimeoutError):
                 time.sleep(15)
@@ -283,7 +305,7 @@ class Server:
         }
 
     def __exit__(self, *exc):
-        if self.proc and self.alive():
+        if self.proc and self.proc.poll() is None:
             self.run.log(f"停止服务（{self.backend}）")
             os.killpg(self.proc.pid, signal.SIGTERM)
             try:
@@ -324,10 +346,7 @@ def stage_launch(
                 except Exception as e:  # noqa: BLE001 - 记在这个阶段上，接着跑下一个
                     run.log(f"{stage} 出错：{type(e).__name__}: {e}")
                     run.record(stage, "FAIL", error=f"{type(e).__name__}: {e}")
-                if not srv.alive():
-                    reason = (
-                        f"服务进程已退出（返回码 {srv.proc.returncode}），请查看 {srv.log_path}"
-                    )
+                if reason := srv.dead_reason():
                     break
     except Exception as e:  # noqa: BLE001 - 这次启动失败，也要留下报告
         reason = f"{type(e).__name__}: {e}"
@@ -574,6 +593,34 @@ def compare(ref: list[dict], got: list[dict]) -> dict:
     }
 
 
+def run_logged(
+    args, cmd, log: Path, srv: Server | None = None, timeout: float | None = None
+) -> int:
+    """在仓库根目录跑一条命令，输出写进 log，返回返回码。
+
+    srv 给出时每分钟看一次服务，服务退出就杀掉命令并抛异常；timeout 到了也杀掉，返回 -9。
+    """
+    deadline = None if timeout is None else time.time() + timeout
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}  # 命令被杀掉时，已有的输出也留在日志里
+    with open(log, "w") as f:
+        proc = subprocess.Popen(
+            cmd, cwd=args.repo, env=env, stdout=f, stderr=subprocess.STDOUT, start_new_session=True
+        )
+        try:
+            while True:
+                try:
+                    return proc.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    if srv is not None and (reason := srv.dead_reason()):
+                        raise RuntimeError(reason) from None
+                    if deadline is not None and time.time() > deadline:
+                        return -9
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+
+
 def run_bench(run: Run, srv: Server, args, bench: dict = BENCH, tag: str = "") -> dict:
     out_file = run.out / f"bench_serving_{srv.label}{tag}.jsonl"
     out_file.unlink(missing_ok=True)
@@ -593,10 +640,9 @@ def run_bench(run: Run, srv: Server, args, bench: dict = BENCH, tag: str = "") -
     ]  # fmt: skip
     run.log(f"  bench_serving：{shlex.join(cmd)}")
     log = run.out / f"bench_serving_{srv.label}{tag}.log"
-    with open(log, "w") as f:
-        r = subprocess.run(cmd, cwd=args.repo, stdout=f, stderr=subprocess.STDOUT, check=False)
-    if r.returncode != 0 or not out_file.exists():
-        raise RuntimeError(f"bench_serving 失败（返回码 {r.returncode}），请查看 {log}")
+    rc = run_logged(args, cmd, log, srv=srv)
+    if rc != 0 or not out_file.exists():
+        raise RuntimeError(f"bench_serving 失败（返回码 {rc}），请查看 {log}")
     result = json.loads(out_file.read_text().strip().splitlines()[-1])
     keep = (
         "completed", "request_throughput", "input_throughput", "output_throughput",
@@ -760,8 +806,9 @@ def main() -> int:
             print(shlex.join(server_cmd(args, backend)), end="\n\n")
         return 0
 
-    # SSH 断开时照 Ctrl-C 处理：先停掉服务，再写报告、打包
+    # SSH 断开或被 kill 时照 Ctrl-C 处理：先停掉服务，再写报告、打包
     signal.signal(signal.SIGHUP, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     run = Run(Path(args.out))
     stages = {s.strip().upper() for s in args.stages.split(",")}
     # fa 那次启动总是 C1、C2 一起跑；重跑它时，C3、C4 对照的是旧的参考输出，一起清掉
