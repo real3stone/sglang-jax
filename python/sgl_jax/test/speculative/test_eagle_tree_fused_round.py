@@ -199,7 +199,7 @@ def _randomize(runner, seed, int_leaf=None):
 class _Harness:
     """One target + EAGLE3 worker pair and the decode state both paths start from."""
 
-    def __init__(self, root, page_size, topk, steps, num_draft_tokens):
+    def __init__(self, root, page_size, topk, steps, num_draft_tokens, tp_size=1):
         from sgl_jax.srt.managers.tp_worker import ModelWorker
         from sgl_jax.srt.server_args import ServerArgs
         from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
@@ -214,6 +214,7 @@ class _Harness:
             speculative_num_steps=steps,
             speculative_num_draft_tokens=num_draft_tokens,
             page_size=page_size,
+            tp_size=tp_size,
             attention_backend="fa",
             disable_overlap_schedule=True,
             load_format="dummy",
@@ -231,7 +232,7 @@ class _Harness:
             chunked_prefill_size=64,
             max_prefill_tokens=64,
         )
-        mesh = create_device_mesh(ici_parallelism=[1, 1], dcn_parallelism=[1, 1])
+        mesh = create_device_mesh(ici_parallelism=[1, tp_size], dcn_parallelism=[1, 1])
         self.target_worker = ModelWorker(server_args=args, mesh=mesh)
         self.spec_worker = EAGLEWorker(server_args=args, target_worker=self.target_worker)
         self.page_size = page_size
@@ -381,13 +382,25 @@ def _assert_same_round(legacy, fused, harness, reqs, seq_lens):
 
 
 @pytest.mark.parametrize(
-    "page_size, topk, steps, num_draft_tokens",
-    [(16, 2, 3, 4), (1, 2, 3, 4), (64, 4, 5, 8)],
+    "page_size, topk, steps, num_draft_tokens, tp_size",
+    [
+        (16, 2, 3, 4, 1),
+        (1, 2, 3, 4, 1),
+        (64, 4, 5, 8, 1),
+        pytest.param(
+            16,
+            2,
+            3,
+            4,
+            2,
+            marks=pytest.mark.skipif(len(jax.devices()) < 2, reason="needs 2 devices"),
+        ),
+    ],
 )
 def test_fused_rounds_match_per_step_path(
-    tmp_path, off_tpu_kernels, monkeypatch, page_size, topk, steps, num_draft_tokens
+    tmp_path, off_tpu_kernels, monkeypatch, page_size, topk, steps, num_draft_tokens, tp_size
 ):
-    harness = _Harness(tmp_path, page_size, topk, steps, num_draft_tokens)
+    harness = _Harness(tmp_path, page_size, topk, steps, num_draft_tokens, tp_size)
     assert harness.spec_worker._can_use_fused_eagle3_tree
 
     moves = []
