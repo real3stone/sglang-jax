@@ -173,6 +173,26 @@ def _draft_decode_kv_lens(seq_lens, speculative_step_id: int, topk: int):
     return xp.where(seq_lens > 0, seq_lens - 1 + (speculative_step_id + 1) * topk, 0)
 
 
+DRAFT_PAGE_TABLE_SIZE = 16384
+
+
+def draft_page_table_size(
+    seq_lens, rank_of_req, *, topk: int, num_steps: int, page_size: int, dp_size: int
+) -> int:
+    """Per-DP-rank length of the EAGLE draft-decode page table.
+
+    ``seq_lens`` and ``rank_of_req`` cover the real slots. The table keeps one
+    size so its shape is stable; it only grows, to a power of two, for a batch
+    whose windows do not fit.
+    """
+    assert DRAFT_PAGE_TABLE_SIZE % dp_size == 0
+    widest_pages = cdiv(_draft_decode_kv_lens(seq_lens, num_steps - 1, topk), page_size)
+    rank_pages = np.bincount(rank_of_req, weights=widest_pages, minlength=dp_size)
+    return max(
+        DRAFT_PAGE_TABLE_SIZE // dp_size, 1 << (max(int(rank_pages.max()), 1) - 1).bit_length()
+    )
+
+
 def _pad_page_indices(
     page_indices: np.ndarray,
     max_num_seqs: int,
@@ -683,19 +703,15 @@ class FlashAttention(AttentionBackend):
         # must be written DP-segmented so the P("data") shard gives each rank
         # its own draft page_indices (otherwise rank>0 reads page 0 → accept~1).
         per_dp_src_pages = full_size // dp_size
-        TARGET_PADDING = 16384
-        assert TARGET_PADDING % dp_size == 0
         rank_of_req = (sel // per_dp_bs).astype(np.int64)
-        # The draft page table keeps one size so its shape is stable; it only
-        # grows, to a power of two, for a batch whose windows do not fit.
         topk = batch.speculative_eagle_topk
-        last_step = batch.speculative_num_steps - 1
-        widest_pages = cdiv(
-            _draft_decode_kv_lens(current_seq_lens, last_step, topk), self.page_size
-        )
-        rank_pages = np.bincount(rank_of_req, weights=widest_pages, minlength=dp_size)
-        per_dp_dst_pages = max(
-            TARGET_PADDING // dp_size, 1 << (max(int(rank_pages.max()), 1) - 1).bit_length()
+        per_dp_dst_pages = draft_page_table_size(
+            current_seq_lens,
+            rank_of_req,
+            topk=topk,
+            num_steps=batch.speculative_num_steps,
+            page_size=self.page_size,
+            dp_size=dp_size,
         )
 
         def _dp_starts(pages, per_dp_base):

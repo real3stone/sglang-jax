@@ -199,7 +199,7 @@ def _randomize(runner, seed, int_leaf=None):
 class _Harness:
     """One target + EAGLE3 worker pair and the decode state both paths start from."""
 
-    def __init__(self, root, page_size, topk, steps, num_draft_tokens, tp_size=1):
+    def __init__(self, root, page_size, topk, steps, num_draft_tokens, tp_size=1, dtype="float32"):
         from sgl_jax.srt.managers.tp_worker import ModelWorker
         from sgl_jax.srt.server_args import ServerArgs
         from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
@@ -218,7 +218,7 @@ class _Harness:
             attention_backend="fa",
             disable_overlap_schedule=True,
             load_format="dummy",
-            dtype="float32",
+            dtype=dtype,
             skip_tokenizer_init=True,
             disable_radix_cache=True,
             random_seed=0,
@@ -291,8 +291,11 @@ class _Harness:
                 pool.kv_buffer[layer] = jax.device_put(kv, pool.kv_sharding)
         self.req_to_token[...] = req_to_token
 
-    def run(self, fused, reqs, seq_lens, seeds, snapshot):
-        """One decode round from ``snapshot``; returns its outputs and the state after it."""
+    def run(self, fused, reqs, seq_lens, seeds, snapshot, alloc_extra=0):
+        """One decode round from ``snapshot``; returns its outputs and the state after it.
+
+        Each request has ``alloc_extra`` more KV slots than the scheduler would give it.
+        """
         self.restore(snapshot)
         spec_worker = self.spec_worker
         spec_worker._can_use_fused_eagle3_tree = fused
@@ -313,7 +316,7 @@ class _Harness:
         mwb.real_bs = real_bs
         mwb.real_bs_per_dp = [real_bs]
         mwb.logits_indices_selector = np.arange(real_bs, dtype=np.int32)
-        allocate_lens = seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE - 1
+        allocate_lens = seq_lens + EagleDraftInput.ALLOC_LEN_PER_DECODE - 1 + alloc_extra
         mwb.spec_info_padded = EagleDraftInput(
             topk_p=np.pad(seeds.topk_p, ((0, pad), (0, 0))),
             topk_index=np.pad(seeds.topk_index, ((0, pad), (0, 0))),
@@ -443,7 +446,8 @@ def test_fused_rounds_match_per_step_path(
     monkeypatch.setattr(eagle_util, "build_tree_kernel_efficient_preprocess", record_tree)
 
     reqs = np.array([5, 2, 6])
-    seq_lens = np.array([37, 64, 9])
+    # 126 puts the widest window one column past 128, the first mask-width bucket.
+    seq_lens = np.array([37, 126, 9])
     seeds = harness.seeds(seq_lens, seed=0)
     snapshot = harness.snapshot()
     for round_id in range(4):
@@ -490,3 +494,42 @@ def test_rounds_outside_the_fused_path_take_the_per_step_path(changes, expected)
         return_output_logprob_only=changes.get("return_output_logprob_only", False),
     )
     assert BaseSpecWorker._use_fused_eagle3_tree(worker, batch) is expected
+
+
+def test_precompile_covers_the_fused_tree_jits(tmp_path, off_tpu_kernels):
+    """Rounds after precompile hit the compiled JITs, with bf16 draft seeds."""
+    harness = _Harness(tmp_path, 16, 2, 3, 4, dtype="bfloat16")
+    spec_worker = harness.spec_worker
+    spec_worker.precompile_spec_decode()
+    draft_worker = spec_worker.draft_worker
+    jits = (
+        draft_worker._fused_eagle3_tree_verify_jit_fn,
+        draft_worker._fused_eagle3_tree_draft_extend_jit_fn,
+    )
+    compiled = [jit._cache_size() for jit in jits]
+
+    reqs, seq_lens = np.array([5, 2, 6]), np.array([37, 64, 9])
+    seeds = harness.seeds(seq_lens, seed=0)
+    seeds.topk_p = seeds.topk_p.astype(jnp.bfloat16)
+    seeds.hidden_states = seeds.hidden_states.astype(jnp.bfloat16)
+    snapshot = harness.snapshot()
+    for _ in range(2):
+        result = harness.run(True, reqs, seq_lens, seeds, snapshot)
+        seq_lens = seq_lens + result["accept"]
+        seeds, snapshot = result["seeds"], result["snapshot"]
+    assert [jit._cache_size() for jit in jits] == compiled
+
+
+def test_tree_windows_must_fit_the_allocation(tmp_path, off_tpu_kernels):
+    # 3/2/4 needs seq_lens + 3 slots: the verify window and the last draft step.
+    harness = _Harness(tmp_path, 1, 2, 3, 4)
+    reqs, seq_lens = np.array([5, 2]), np.array([37, 9])
+    with pytest.raises(AssertionError, match="tree windows need"):
+        harness.run(
+            True,
+            reqs,
+            seq_lens,
+            harness.seeds(seq_lens, seed=0),
+            harness.snapshot(),
+            alloc_extra=-3,
+        )

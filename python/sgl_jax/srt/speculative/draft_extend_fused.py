@@ -929,6 +929,7 @@ def _make_eagle3_tree_draft_metadata(
     step: int,
     topk: int,
     width: int,
+    page_table_size: int,
     page_size: int,
     dp_size: int,
 ):
@@ -936,7 +937,9 @@ def _make_eagle3_tree_draft_metadata(
 
     Every slot feeds ``topk`` sibling rows. ``parents_by_step[s - 1]`` is the
     parent array ``select_top_k_tokens`` produced at step ``s``; the tree mask
-    lets each row see the slot's context and its own ancestors only.
+    lets each row see the slot's context and its own ancestors only. The page
+    table has ``page_table_size`` entries per DP rank, the size the attention
+    kernel's block sizes are derived from.
     """
     from sgl_jax.srt.layers.attention.flashattention_backend import (
         FlashAttentionMetadata,
@@ -958,7 +961,13 @@ def _make_eagle3_tree_draft_metadata(
         kv_lens,
         page_size=page_size,
         dp_size=dp_size,
-    )
+    ).reshape(dp_size, -1)
+    pages_per_dp = page_indices.shape[1]
+    if pages_per_dp >= page_table_size:
+        page_indices = page_indices[:, :page_table_size]
+    else:
+        page_indices = jnp.pad(page_indices, ((0, 0), (0, page_table_size - pages_per_dp)))
+    page_indices = page_indices.reshape(-1)
 
     valid_rows = _reshape_per_dp_rows(valid, dp_size)
     local_num_seqs = jnp.sum(valid_rows.astype(jnp.int32), axis=1)
@@ -1533,7 +1542,12 @@ def _build_eagle3_tree_verify(num_steps: int, topk: int, num_draft_tokens: int):
     @partial(
         jax.jit,
         donate_argnames=["target_memory_pools", "draft_memory_pools"],
-        static_argnames=["target_model_state_def", "draft_model_state_def", "width"],
+        static_argnames=[
+            "target_model_state_def",
+            "draft_model_state_def",
+            "width",
+            "draft_page_table_size",
+        ],
     )
     def fused_eagle3_tree_verify(
         target_model_def,
@@ -1557,6 +1571,7 @@ def _build_eagle3_tree_verify(num_steps: int, topk: int, num_draft_tokens: int):
         hot_token_ids,
         *,
         width,
+        draft_page_table_size,
     ):
         bs = seq_lens.shape[0]
         page_size = target_forward_batch.attn_backend.page_size
@@ -1595,6 +1610,7 @@ def _build_eagle3_tree_verify(num_steps: int, topk: int, num_draft_tokens: int):
                 step=step,
                 topk=topk,
                 width=width,
+                page_table_size=draft_page_table_size,
                 page_size=page_size,
                 dp_size=1,
             )
@@ -2959,6 +2975,21 @@ def spec_decode_verify(
     return batch_output
 
 
+def _make_tree_forward_batch(batch, model_runner):
+    """``_make_forward_batch`` with one-slot ``out_cache_loc`` and ``cache_loc``.
+
+    Flash attention writes and reads KV through the forward metadata's page
+    table, so neither array is read; their per-round lengths would otherwise
+    change the JIT's input shapes and add a large upload.
+    """
+    out_cache_loc, cache_loc = batch.out_cache_loc, batch.cache_loc
+    batch.out_cache_loc = batch.cache_loc = np.zeros(1, dtype=np.int32)
+    try:
+        return _make_forward_batch(batch, model_runner)
+    finally:
+        batch.out_cache_loc, batch.cache_loc = out_cache_loc, cache_loc
+
+
 def _tree_draft_hidden_placeholder(draft_worker, bs: int):
     cache = getattr(draft_worker, "_tree_draft_hidden_placeholder_cache", None)
     if cache is None:
@@ -2986,6 +3017,7 @@ def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens
         FlashAttentionMetadata,
         _draft_decode_kv_lens,
         _padding_trails,
+        draft_page_table_size,
         mask_row_width,
     )
     from sgl_jax.srt.layers.logits_processor import (
@@ -3006,7 +3038,8 @@ def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens
 
     draft_worker.padding_for_decode(model_worker_batch, map_hot_token_ids=False)
     seeds = model_worker_batch.spec_info_padded
-    seq_lens = np.asarray(model_worker_batch.seq_lens)
+    # prepare_for_verify decrements model_worker_batch.seq_lens in place.
+    seq_lens = np.array(model_worker_batch.seq_lens, dtype=np.int32)
     bs = seq_lens.shape[0]
     assert _padding_trails(seq_lens, 1, bs), "tree verify padding slots must trail the real slots"
 
@@ -3016,13 +3049,13 @@ def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens
         (seeds.topk_p, seeds.topk_index, seeds.hidden_states, seeds.verified_id), replicated
     )
     seq_lens_device, allocate_lens = jax.device_put(
-        (seq_lens.astype(np.int32), np.asarray(seeds.allocate_lens, dtype=np.int32)),
+        (seq_lens, np.asarray(seeds.allocate_lens, dtype=np.int32)),
         data_sharding,
     )
 
     base_metadata = draft_mr.attn_backend.get_eagle_base_metadata(model_worker_batch)
     draft_mr.attn_backend.forward_metadata = base_metadata
-    draft_forward_batch = _make_forward_batch(model_worker_batch, draft_mr)
+    draft_forward_batch = _make_tree_forward_batch(model_worker_batch, draft_mr)
     draft_forward_batch.bid = model_worker_batch.bid
     draft_forward_batch.spec_info = EagleDraftInput(
         hidden_states=_tree_draft_hidden_placeholder(draft_worker, bs)
@@ -3036,7 +3069,7 @@ def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens
     target_mr.attn_backend.forward_metadata = FlashAttentionMetadata(
         page_indices=base_metadata.page_indices
     )
-    target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
+    target_forward_batch = _make_tree_forward_batch(model_worker_batch, target_mr)
     target_forward_batch.bid = model_worker_batch.bid
     target_logits_metadata = _prepare_logits_metadata(model_worker_batch, spec_worker.mesh)
 
@@ -3045,6 +3078,23 @@ def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens
     draft_kv_lens = _draft_decode_kv_lens(seq_lens, max(num_steps - 2, 0), topk)
     widest = np.maximum(verify_kv_lens, draft_kv_lens)
     width = mask_row_width(((widest + page_size - 1) // page_size) * page_size)
+    # A window past its request's allocated pages would read and write the
+    # next request's KV.
+    extend_kv_lens = np.where(seq_lens > 0, seq_lens - 1 + num_steps, 0)
+    window_pages = -(-np.maximum(widest, extend_kv_lens) // page_size)
+    allocated_pages = -(-np.asarray(seeds.allocate_lens) // page_size)
+    assert np.all(
+        window_pages <= allocated_pages
+    ), f"tree windows need {window_pages} pages but only {allocated_pages} are allocated"
+    real = seq_lens > 0
+    page_table_size = draft_page_table_size(
+        seq_lens[real],
+        np.zeros(int(real.sum()), dtype=np.int64),
+        topk=topk,
+        num_steps=num_steps,
+        page_size=page_size,
+        dp_size=1,
+    )
 
     if not hasattr(draft_worker, "_fused_eagle3_tree_verify_jit_fn"):
         draft_worker._fused_eagle3_tree_verify_jit_fn = _build_eagle3_tree_verify(
@@ -3073,6 +3123,7 @@ def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens
                 allocate_lens,
                 draft_worker.hot_token_ids,
                 width=width,
+                draft_page_table_size=page_table_size,
             )
         )
         cache_miss_count = count()
@@ -3138,7 +3189,7 @@ def launch_eagle3_tree_draft_extend(spec_worker, model_worker_batch, batch_outpu
         capture_hidden_mode=CaptureHiddenMode.FULL,
     )
     draft_mr.attn_backend.forward_metadata = FlashAttentionMetadata(page_indices=page_indices)
-    forward_batch = _make_forward_batch(model_worker_batch, draft_mr)
+    forward_batch = _make_tree_forward_batch(model_worker_batch, draft_mr)
     forward_batch.bid = model_worker_batch.bid
     logits_metadata = _prepare_logits_metadata(model_worker_batch, draft_worker.mesh)
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))

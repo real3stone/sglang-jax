@@ -21,6 +21,7 @@ from sgl_jax.srt.layers.attention.flashattention_backend import (
     FlashAttention,
     FlashAttentionMetadata,
     _draft_decode_kv_lens,
+    draft_page_table_size,
     mask_row_width,
 )
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, copy_kv_rows_in_jit
@@ -125,6 +126,7 @@ TREE_CASES = [
     ([5, 9, 3], 4, 2, 4),
     ([17, 6], 2, 3, 3),
     ([125, 4, 70], 4, 4, 4),  # the widest draft row crosses 128 within the round
+    ([9000, 8000], 2, 2, 3),  # windows overflow the default draft page table at page_size 1
 ]
 
 
@@ -155,6 +157,14 @@ def test_draft_step_metadata_matches_host(seq_lens, padded_bs, topk, steps, page
     base = backend.get_eagle_base_metadata(batch)
     widest = _draft_decode_kv_lens(seq, max(steps - 2, 0), topk)
     width = mask_row_width(_aligned(widest, page_size)) + extra_width
+    page_table_size = draft_page_table_size(
+        seq[:real],
+        np.zeros(real, dtype=np.int64),
+        topk=topk,
+        num_steps=steps,
+        page_size=page_size,
+        dp_size=1,
+    )
 
     data = NamedSharding(mesh, P("data"))
     with jax.set_mesh(mesh):
@@ -166,12 +176,17 @@ def test_draft_step_metadata_matches_host(seq_lens, padded_bs, topk, steps, page
                     step=step,
                     topk=topk,
                     width=width,
+                    page_table_size=page_table_size,
                     page_size=page_size,
                     dp_size=1,
                 )
             )
             device = build(base, seq_device, alloc_device, tuple(parents_by_step[1 : step + 1]))
             _assert_same_layout(device, host_steps[step], page_size)
+            # The attention kernel derives its block sizes from the table length.
+            np.testing.assert_array_equal(
+                np.asarray(device.page_indices), np.asarray(host_steps[step].page_indices)
+            )
             host_mask = backend.get_eagle_draft_decode_mask(batch, step, parents_by_step)
             _assert_same_mask(device.custom_mask, host_mask)
             assert device.custom_mask.sharding.is_equivalent_to(data, 3)

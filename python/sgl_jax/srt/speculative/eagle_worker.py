@@ -163,14 +163,15 @@ class EAGLEWorker(BaseSpecWorker):
                 else:
                     topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
                 data_sharding = NamedSharding(self.mesh, P("data"))
+                hidden_dtype = jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
+                # Tree drafting consumes topk_p in the draft logits' dtype.
+                topk_p_dtype = hidden_dtype if self.topk > 1 else np.float32
                 spec_info = EagleDraftInput(
-                    topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
+                    topk_p=jax.device_put(np.ones(topk_shape, dtype=topk_p_dtype), data_sharding),
                     topk_index=jax.device_put(np.ones(topk_shape, dtype=np.int32), data_sharding),
                     hidden_states=np.ones(
                         (bs, self.draft_worker.model_config.hidden_size),
-                        dtype=(
-                            jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
-                        ),
+                        dtype=hidden_dtype,
                     ),
                     verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
                     capture_hidden_mode=CaptureHiddenMode.FULL,
