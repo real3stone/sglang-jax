@@ -164,6 +164,7 @@ class WorkloadInputBuilder(ABC):
         recurrent_indices = None
         if context.memory_pools.recurrent_state_pool is not None:
             recurrent_indices = metadata.linear_attn_metadata.recurrent_indices
+        ple_width = getattr(context.model_config.hf_text_config, "ple_embeddings_width", 0)
         return ForwardBatch(
             bid=0,
             forward_mode=self.forward_mode,
@@ -179,6 +180,11 @@ class WorkloadInputBuilder(ABC):
             recurrent_cow_src_indices=(
                 vector(spec.request_count)
                 if context.supports_recurrent_cow and self.forward_mode.is_extend()
+                else None
+            ),
+            ple_embeddings=(
+                context.shaped((spec.input_token_count, ple_width), jnp.bfloat16)
+                if ple_width
                 else None
             ),
             spec_algorithm=self.spec_algorithm,
