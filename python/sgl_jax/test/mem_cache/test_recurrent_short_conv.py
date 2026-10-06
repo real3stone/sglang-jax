@@ -114,6 +114,31 @@ class TestConvStateSpecs(CustomTestCase):
         with self.assertRaises(AssertionError):
             _make_pool((LINEAR, ConvStateSpec(SHORT_CONV, (3,), CHANNELS, STATE_LEN)))
 
+    def test_abstract_pool_has_the_allocated_layout(self):
+        """AOT export traces the abstract pool, so its per-layer conv lists
+        must be the ones serving allocates."""
+        real = _make_pool()
+        abstract = RecurrentStatePool(
+            linear_recurrent_layer_ids=LAYERS,
+            size=SIZE,
+            num_heads=NUM_HEADS,
+            head_dim=HEAD_DIM,
+            conv_kernel_size=CONV_KERNEL,
+            mesh=_make_mesh(),
+            conv_dtype=jnp.float32,
+            conv_states=(LINEAR, SHORT),
+            abstract=True,
+        )
+
+        def layout(buffers):
+            return [[(b.shape, b.dtype) for b in layer] for layer in buffers]
+
+        self.assertEqual(layout(abstract.conv_buffers), layout(real.conv_buffers))
+        self.assertEqual(len(abstract.conv_buffers[LAYERS.index(PLE_LAYER)]), 2)
+        self.assertEqual(
+            abstract.get_short_conv_state(PLE_LAYER).shape, (SIZE + 1, CHANNELS, STATE_LEN)
+        )
+
 
 class TestProductionStateConsumers(CustomTestCase):
     def test_gdn_and_kda_preserve_peer_state_in_either_order(self):
