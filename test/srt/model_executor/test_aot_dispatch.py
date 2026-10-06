@@ -164,6 +164,7 @@ class TestAotDispatcher(unittest.TestCase):
         manager.has_recurrent_state = False
         manager.supports_recurrent_cow = False
         manager.supports_recurrent_track = False
+        manager.ple_embeddings_width = 0
         batch = manager._make_dummy_batch(4, 4, ForwardMode.DECODE, 4)
         logits = LogitsProcessorOutput(
             jax.device_put(
