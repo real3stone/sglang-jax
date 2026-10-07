@@ -1687,7 +1687,6 @@ def _build_eagle3_tree_verify(num_steps: int, topk: int, num_draft_tokens: int):
         )
         accept_lens = accept_lens + 1
 
-        kv_buffer = target_pool_updates["token_to_kv_pool"][0]
         kv_copy_src, kv_copy_dst = accepted_path_kv_copies_device(
             accept_index,
             jax.sharding.reshard(verify_seq_lens, P()),
@@ -1695,7 +1694,6 @@ def _build_eagle3_tree_verify(num_steps: int, topk: int, num_draft_tokens: int):
             jax.sharding.reshard(verify_metadata.cu_kv_lens, P()),
             draft_token_num=n,
             page_size=page_size,
-            num_slots=kv_buffer.shape[0] * kv_buffer.shape[1],
         )
 
         flat_accept_index = accept_index.reshape(-1)
@@ -3008,7 +3006,9 @@ def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens
 
     Consumes the draft seeds in ``model_worker_batch.spec_info_padded``.
     Returns the verify result in the layout ``BaseSpecWorker.verify``
-    produces, and the device page table of every request's allocated pages;
+    produces, the device page table of every request's allocated pages, and
+    the accepted-path KV copies the target pool still needs, as the device
+    ``(src, dst)`` pairs ``copy_accepted_tree_kv`` applies;
     ``model_worker_batch`` is left ready for the draft extend.
     """
     from sgl_jax.srt.layers.attention.flashattention_backend import (
@@ -3127,9 +3127,6 @@ def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens
         cache_miss_count = count()
     target_mr.memory_pools.replace_all(target_pool_updates)
     draft_mr.memory_pools.replace_all(draft_pool_updates)
-    # Its own JIT: inside the verify JIT, XLA relayouts every KV buffer
-    # around the scatter, copying the whole pool to move a few rows.
-    target_mr.token_to_kv_pool.copy_kv_rows(result.kv_copy_src, result.kv_copy_dst)
 
     next_draft_input = EagleDraftInput(
         verified_id=result.verified_id,
@@ -3152,7 +3149,7 @@ def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens
         extend_input_len_per_req=None,
         extend_logprob_start_len_per_req=None,
     )
-    return batch_output, base_metadata.page_indices
+    return batch_output, base_metadata.page_indices, (result.kv_copy_src, result.kv_copy_dst)
 
 
 def launch_eagle3_tree_draft_extend(spec_worker, model_worker_batch, batch_output, page_indices):
@@ -3224,22 +3221,40 @@ def launch_eagle3_tree_draft_extend(spec_worker, model_worker_batch, batch_outpu
 def spec_decode_eagle3_tree(spec_worker, model_worker_batch, cur_allocate_lens):
     """Run one EAGLE3 tree decode round as two JITs and one host sync.
 
+    Rounds that accept a node out of place also copy its KV after the sync.
+
     The returned ``next_draft_input`` holds the next round's draft seeds on
     host, in the per-step tree path's layout.
     """
     from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+    from sgl_jax.srt.speculative.eagle_util import copy_accepted_tree_kv
 
-    batch_output, page_indices = launch_eagle3_tree_verify(
+    batch_output, page_indices, kv_copies = launch_eagle3_tree_verify(
         spec_worker, model_worker_batch, cur_allocate_lens
     )
     seeds = launch_eagle3_tree_draft_extend(
         spec_worker, model_worker_batch, batch_output, page_indices
     )
-    outputs = (batch_output.accept_lens, batch_output.next_token_ids, *seeds)
+    outputs = (batch_output.accept_lens, batch_output.next_token_ids, *kv_copies, *seeds)
     for value in outputs:
         value.copy_to_host_async()
-    accept_lens, output_ids, topk_p, topk_index, hidden_states, verified_id = (
-        np.asarray(value) for value in outputs
+    (
+        accept_lens,
+        output_ids,
+        kv_copy_src,
+        kv_copy_dst,
+        topk_p,
+        topk_index,
+        hidden_states,
+        verified_id,
+    ) = (np.asarray(value) for value in outputs)
+    # Only the next verify reads the moved rows, so the copy runs after the
+    # sync and only in rounds where an accepted node is out of place.
+    copy_accepted_tree_kv(
+        spec_worker.target_worker.model_runner.token_to_kv_pool,
+        kv_copy_src,
+        kv_copy_dst,
+        num_pairs=accept_lens.shape[0] * spec_worker.draft_worker.speculative_num_steps,
     )
     real_bs = model_worker_batch.real_bs
     batch_output.accept_lens = accept_lens

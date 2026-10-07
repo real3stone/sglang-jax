@@ -698,12 +698,11 @@ class MHATokenToKVPool(KVCache):
     def replace_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
-    def copy_kv_rows(self, src: np.ndarray | jax.Array, dst: np.ndarray | jax.Array) -> None:
+    def copy_kv_rows(self, src: np.ndarray, dst: np.ndarray) -> None:
         """Copy every layer's KV at token slot ``src[i]`` to slot ``dst[i]``.
 
         All rows are read before any is written, so ``src`` and ``dst`` may
-        overlap. A pair with ``src[i] == dst[i]`` is a no-op, and one whose
-        ``dst[i]`` is past the last slot is skipped.
+        overlap. A pair with ``src[i] == dst[i]`` is a no-op.
         """
         kv_lock = getattr(self, "_donate_lock", None)
         lock_ctx = kv_lock if kv_lock is not None else contextlib.nullcontext()
@@ -1421,26 +1420,15 @@ def write_kv_layer(
     )
 
 
-def copy_kv_rows_in_jit(kv_buffers, src, dst, kv_spec):
-    """Copy every buffer's KV at token slot ``src[i]`` to slot ``dst[i]``.
-
-    All rows are read before any is written. A ``dst`` past the last slot is
-    skipped.
-    """
+@partial(jax.jit, static_argnames=("kv_spec",), donate_argnums=(0,))
+def _copy_kv_rows(kv_buffers, src, dst, kv_spec):
     row_spec = P(None, *kv_spec[2:])
     out = []
     for kv in kv_buffers:
         page_size = kv.shape[1]
         rows = kv.at[src // page_size, src % page_size].get(out_sharding=row_spec)
-        out.append(
-            kv.at[dst // page_size, dst % page_size].set(rows, out_sharding=kv_spec, mode="drop")
-        )
+        out.append(kv.at[dst // page_size, dst % page_size].set(rows, out_sharding=kv_spec))
     return out
-
-
-@partial(jax.jit, static_argnames=("kv_spec",), donate_argnums=(0,))
-def _copy_kv_rows(kv_buffers, src, dst, kv_spec):
-    return copy_kv_rows_in_jit(kv_buffers, src, dst, kv_spec)
 
 
 def update_fused_kv_cache(

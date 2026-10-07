@@ -24,7 +24,7 @@ from sgl_jax.srt.layers.attention.flashattention_backend import (
     draft_page_table_size,
     mask_row_width,
 )
-from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, copy_kv_rows_in_jit
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 from sgl_jax.srt.speculative.draft_extend_fused import (
@@ -40,6 +40,7 @@ from sgl_jax.srt.speculative.eagle_util import (
     accepted_path_kv_copies_device,
     build_tree_kernel_efficient,
     build_tree_kernel_efficient_device,
+    copy_accepted_tree_kv,
     front_pack_accepted_tokens,
     front_pack_accepted_tokens_device,
 )
@@ -448,30 +449,21 @@ def test_accepted_path_kv_matches_host(page_size, paths):
     BaseSpecWorker._move_accepted_paths_to_front(worker, mwb, accept_index)
 
     device_pool = _kv_pool(page_size)
-    kv = device_pool.kv_buffer[0]
-    num_slots = kv.shape[0] * kv.shape[1]
-
-    @jax.jit
-    def move(kv_buffers, accept_index, window_starts, page_indices, cu_kv_lens):
-        src, dst = accepted_path_kv_copies_device(
-            accept_index,
-            window_starts,
-            page_indices,
-            cu_kv_lens,
-            draft_token_num=N,
-            page_size=page_size,
-            num_slots=num_slots,
-        )
-        return copy_kv_rows_in_jit(kv_buffers, src, dst, device_pool.kv_sharding.spec)
-
     mesh = _mesh()
     with jax.set_mesh(mesh):
-        device_pool.kv_buffer[:] = move(
-            device_pool.kv_buffer,
+        src, dst = jax.jit(
+            partial(accepted_path_kv_copies_device, draft_token_num=N, page_size=page_size)
+        )(
             *jax.device_put(
                 (accept_index, window_starts, page_indices, cu_kv_lens), NamedSharding(mesh, P())
-            ),
+            )
         )
+    copy_accepted_tree_kv(
+        device_pool,
+        np.asarray(src),
+        np.asarray(dst),
+        num_pairs=accept_index.size - accept_index.shape[0],
+    )
 
     for s, path in enumerate(paths[:2]):
         req = req_pool_indices[s]
@@ -480,6 +472,16 @@ def test_accepted_path_kv_matches_host(page_size, paths):
             _rows(device_pool, before[req, :committed]),
             _rows(host_pool, req_to_token[req, :committed]),
         )
+
+
+def test_accepted_tree_kv_copy_runs_only_for_moved_nodes():
+    calls = []
+    pool = SimpleNamespace(copy_kv_rows=lambda src, dst: calls.append((src.tolist(), dst.tolist())))
+    src = np.array([7, 9, 4, 3], dtype=np.int32)
+    copy_accepted_tree_kv(pool, src, np.full(4, -1, dtype=np.int32), num_pairs=3)
+    assert calls == []
+    copy_accepted_tree_kv(pool, src, np.array([-1, 12, -1, 13], dtype=np.int32), num_pairs=3)
+    assert calls == [([9, 3, 0], [12, 13, 0])]
 
 
 @pytest.mark.parametrize("draft_token_num, accept_width", [(4, 4), (8, 4), (3, 4)])

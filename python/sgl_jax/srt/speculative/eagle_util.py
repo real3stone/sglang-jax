@@ -427,7 +427,6 @@ def accepted_path_kv_copies_device(
     *,
     draft_token_num: int,
     page_size: int,
-    num_slots: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Device version of ``accepted_path_kv_copies`` over a verify page table.
 
@@ -435,7 +434,7 @@ def accepted_path_kv_copies_device(
     ``page_indices[cu_kv_lens[s] // page_size + p // page_size]``, the layout
     the verify attention reads. Returns one ``(src, dst)`` pair per entry of
     ``accept_index``; a pair whose node already sits at its path position has
-    ``dst == num_slots``, past the last slot, so a dropping scatter skips it.
+    ``dst == -1``.
     """
     bs, accept_width = accept_index.shape
     node = accept_index - jnp.arange(bs, dtype=jnp.int32)[:, None] * draft_token_num
@@ -450,8 +449,22 @@ def accepted_path_kv_copies_device(
         return page * page_size + pos % page_size
 
     src = slot(jnp.where(moved, node, 0))
-    dst = jnp.where(moved, slot(depth), num_slots)
+    dst = jnp.where(moved, slot(depth), -1)
     return src.reshape(-1).astype(jnp.int32), dst.reshape(-1).astype(jnp.int32)
+
+
+def copy_accepted_tree_kv(kv_pool, src: np.ndarray, dst: np.ndarray, num_pairs: int) -> None:
+    """Apply the ``(src, dst)`` pairs of ``accepted_path_kv_copies_device``.
+
+    Pairs with ``dst == -1`` are dropped, and nothing runs when every pair is.
+    The rest are padded with no-op ``0 -> 0`` pairs to ``num_pairs``, so one
+    compiled copy serves every round of a batch size.
+    """
+    moved = dst >= 0
+    if not moved.any():
+        return
+    pad = num_pairs - int(moved.sum())
+    kv_pool.copy_kv_rows(np.pad(src[moved], (0, pad)), np.pad(dst[moved], (0, pad)))
 
 
 def assign_req_to_token_pool(

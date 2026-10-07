@@ -14,6 +14,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, For
 from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+from sgl_jax.srt.speculative.eagle_util import copy_accepted_tree_kv
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,16 @@ class EAGLEWorker(BaseSpecWorker):
                     jax.block_until_ready(self.spec_relay_buffers)
                 else:
                     self.forward_batch_speculative_generation(model_worker_batch)
+                if self._can_use_fused_eagle3_tree:
+                    # A round copies accepted-path KV only when a node moves;
+                    # a 0 -> 0 move compiles that copy for this batch size.
+                    no_op = np.zeros(1, dtype=np.int32)
+                    copy_accepted_tree_kv(
+                        self.target_worker.model_runner.token_to_kv_pool,
+                        no_op,
+                        no_op,
+                        num_pairs=bs * self.speculative_num_steps,
+                    )
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)

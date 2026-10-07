@@ -24,6 +24,7 @@ import sgl_jax.srt.speculative.eagle_util as eagle_util
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     merge_kv,
 )
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, _copy_kv_rows
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
@@ -260,7 +261,7 @@ class _Harness:
         for pool, seed in ((self.target_pool, 1), (self.draft_pool, 2)):
             fill = np.random.default_rng(seed)
             for layer, kv in enumerate(pool.kv_buffer):
-                values = fill.standard_normal(kv.shape).astype(np.float32)
+                values = fill.standard_normal(kv.shape).astype(kv.dtype)
                 pool.kv_buffer[layer] = jax.device_put(values, pool.kv_sharding)
 
     def seeds(self, seq_lens, seed):
@@ -332,6 +333,7 @@ class _Harness:
         emitted = np.asarray(out.next_token_ids).reshape(total_bs, self.num_draft_tokens)
         draft = out.next_draft_input
         return {
+            "padded_bs": total_bs,
             "accept": accept,
             "emitted": [emitted[i, : accept[i]] for i in range(real_bs)],
             "seeds": EagleDraftInput(
@@ -415,6 +417,14 @@ def test_fused_rounds_match_per_step_path(
         return move_paths(self, model_worker_batch, accept_index)
 
     monkeypatch.setattr(BaseSpecWorker, "_move_accepted_paths_to_front", record_moves)
+    copies = []
+    copy_kv_rows = MHATokenToKVPool.copy_kv_rows
+
+    def record_copy(self, src, dst):
+        copies.append(len(src))
+        return copy_kv_rows(self, src, dst)
+
+    monkeypatch.setattr(MHATokenToKVPool, "copy_kv_rows", record_copy)
     launches = []
 
     def recorded(name):
@@ -460,7 +470,10 @@ def test_fused_rounds_match_per_step_path(
             reqs = np.concatenate([reqs[keep], [0, 7]])
             seq_lens = np.concatenate([seq_lens[keep], joined])
         legacy = harness.run(False, reqs, seq_lens, seeds, snapshot)
+        copies.clear()
         fused = harness.run(True, reqs, seq_lens, seeds, snapshot)
+        # One copy padded to the batch size, and none when no node moved.
+        assert copies == ([fused["padded_bs"] * steps] if moves[-1] else [])
         jax.effects_barrier()
         legacy_tree, fused_tree = trees[-2:]
         for name, got, want in zip(
@@ -496,7 +509,7 @@ def test_rounds_outside_the_fused_path_take_the_per_step_path(changes, expected)
     assert BaseSpecWorker._use_fused_eagle3_tree(worker, batch) is expected
 
 
-def test_precompile_covers_the_fused_tree_jits(tmp_path, off_tpu_kernels):
+def test_precompile_covers_the_fused_tree_jits(tmp_path, off_tpu_kernels, monkeypatch):
     """Rounds after precompile hit the compiled JITs, with bf16 draft seeds."""
     harness = _Harness(tmp_path, 16, 2, 3, 4, dtype="bfloat16")
     spec_worker = harness.spec_worker
@@ -505,8 +518,17 @@ def test_precompile_covers_the_fused_tree_jits(tmp_path, off_tpu_kernels):
     jits = (
         draft_worker._fused_eagle3_tree_verify_jit_fn,
         draft_worker._fused_eagle3_tree_draft_extend_jit_fn,
+        _copy_kv_rows,
     )
     compiled = [jit._cache_size() for jit in jits]
+    copies = []
+    copy_kv_rows = MHATokenToKVPool.copy_kv_rows
+
+    def record_copy(self, src, dst):
+        copies.append(len(src))
+        return copy_kv_rows(self, src, dst)
+
+    monkeypatch.setattr(MHATokenToKVPool, "copy_kv_rows", record_copy)
 
     reqs, seq_lens = np.array([5, 2, 6]), np.array([37, 64, 9])
     seeds = harness.seeds(seq_lens, seed=0)
@@ -517,6 +539,7 @@ def test_precompile_covers_the_fused_tree_jits(tmp_path, off_tpu_kernels):
         result = harness.run(True, reqs, seq_lens, seeds, snapshot)
         seq_lens = seq_lens + result["accept"]
         seeds, snapshot = result["seeds"], result["snapshot"]
+    assert copies, "no round moved a node; the KV copy's precompile went unchecked"
     assert [jit._cache_size() for jit in jits] == compiled
 
 
