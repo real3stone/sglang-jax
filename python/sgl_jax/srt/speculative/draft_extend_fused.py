@@ -3251,10 +3251,7 @@ def spec_decode_eagle3_tree(spec_worker, model_worker_batch, cur_allocate_lens):
     # Only the next verify reads the moved rows, so the copy runs after the
     # sync and only in rounds where an accepted node is out of place.
     copy_accepted_tree_kv(
-        spec_worker.target_worker.model_runner.token_to_kv_pool,
-        kv_copy_src,
-        kv_copy_dst,
-        num_pairs=accept_lens.shape[0] * spec_worker.draft_worker.speculative_num_steps,
+        spec_worker.target_worker.model_runner.token_to_kv_pool, kv_copy_src, kv_copy_dst
     )
     real_bs = model_worker_batch.real_bs
     batch_output.accept_lens = accept_lens

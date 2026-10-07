@@ -458,12 +458,7 @@ def test_accepted_path_kv_matches_host(page_size, paths):
                 (accept_index, window_starts, page_indices, cu_kv_lens), NamedSharding(mesh, P())
             )
         )
-    copy_accepted_tree_kv(
-        device_pool,
-        np.asarray(src),
-        np.asarray(dst),
-        num_pairs=accept_index.size - accept_index.shape[0],
-    )
+    copy_accepted_tree_kv(device_pool, np.asarray(src), np.asarray(dst))
 
     for s, path in enumerate(paths[:2]):
         req = req_pool_indices[s]
@@ -478,10 +473,11 @@ def test_accepted_tree_kv_copy_runs_only_for_moved_nodes():
     calls = []
     pool = SimpleNamespace(copy_kv_rows=lambda src, dst: calls.append((src.tolist(), dst.tolist())))
     src = np.array([7, 9, 4, 3], dtype=np.int32)
-    copy_accepted_tree_kv(pool, src, np.full(4, -1, dtype=np.int32), num_pairs=3)
+    copy_accepted_tree_kv(pool, src, np.full(4, -1, dtype=np.int32))
     assert calls == []
-    copy_accepted_tree_kv(pool, src, np.array([-1, 12, -1, 13], dtype=np.int32), num_pairs=3)
-    assert calls == [([9, 3, 0], [12, 13, 0])]
+    copy_accepted_tree_kv(pool, src, np.array([-1, 12, -1, 13], dtype=np.int32))
+    copy_accepted_tree_kv(pool, src, np.array([11, 12, -1, 13], dtype=np.int32))
+    assert calls == [([9, 3], [12, 13]), ([7, 9, 3, 0], [11, 12, 13, 0])]
 
 
 @pytest.mark.parametrize("draft_token_num, accept_width", [(4, 4), (8, 4), (3, 4)])

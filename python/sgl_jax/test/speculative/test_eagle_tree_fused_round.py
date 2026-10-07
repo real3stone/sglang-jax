@@ -333,7 +333,6 @@ class _Harness:
         emitted = np.asarray(out.next_token_ids).reshape(total_bs, self.num_draft_tokens)
         draft = out.next_draft_input
         return {
-            "padded_bs": total_bs,
             "accept": accept,
             "emitted": [emitted[i, : accept[i]] for i in range(real_bs)],
             "seeds": EagleDraftInput(
@@ -472,8 +471,8 @@ def test_fused_rounds_match_per_step_path(
         legacy = harness.run(False, reqs, seq_lens, seeds, snapshot)
         copies.clear()
         fused = harness.run(True, reqs, seq_lens, seeds, snapshot)
-        # One copy padded to the batch size, and none when no node moved.
-        assert copies == ([fused["padded_bs"] * steps] if moves[-1] else [])
+        # One copy padded to a power of two, and none when no node moved.
+        assert copies == ([1 << (moves[-1] - 1).bit_length()] if moves[-1] else [])
         jax.effects_barrier()
         legacy_tree, fused_tree = trees[-2:]
         for name, got, want in zip(

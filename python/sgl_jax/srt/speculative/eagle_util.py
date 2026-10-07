@@ -453,17 +453,19 @@ def accepted_path_kv_copies_device(
     return src.reshape(-1).astype(jnp.int32), dst.reshape(-1).astype(jnp.int32)
 
 
-def copy_accepted_tree_kv(kv_pool, src: np.ndarray, dst: np.ndarray, num_pairs: int) -> None:
+def copy_accepted_tree_kv(kv_pool, src: np.ndarray, dst: np.ndarray) -> None:
     """Apply the ``(src, dst)`` pairs of ``accepted_path_kv_copies_device``.
 
     Pairs with ``dst == -1`` are dropped, and nothing runs when every pair is.
-    The rest are padded with no-op ``0 -> 0`` pairs to ``num_pairs``, so one
-    compiled copy serves every round of a batch size.
+    Every pair costs a row gather and scatter in each layer, so the rest are
+    padded with no-op ``0 -> 0`` pairs only up to a power of two, which keeps
+    the compiled sizes few.
     """
     moved = dst >= 0
-    if not moved.any():
+    num_moves = int(moved.sum())
+    if num_moves == 0:
         return
-    pad = num_pairs - int(moved.sum())
+    pad = (1 << (num_moves - 1).bit_length()) - num_moves
     kv_pool.copy_kv_rows(np.pad(src[moved], (0, pad)), np.pad(dst[moved], (0, pad)))
 
 

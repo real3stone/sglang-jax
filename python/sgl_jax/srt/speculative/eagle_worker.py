@@ -214,15 +214,16 @@ class EAGLEWorker(BaseSpecWorker):
                 else:
                     self.forward_batch_speculative_generation(model_worker_batch)
                 if self._can_use_fused_eagle3_tree:
-                    # A round copies accepted-path KV only when a node moves;
-                    # a 0 -> 0 move compiles that copy for this batch size.
-                    no_op = np.zeros(1, dtype=np.int32)
-                    copy_accepted_tree_kv(
-                        self.target_worker.model_runner.token_to_kv_pool,
-                        no_op,
-                        no_op,
-                        num_pairs=bs * self.speculative_num_steps,
-                    )
+                    # A round copies accepted-path KV only when a node moves,
+                    # in power-of-two sizes up to every move this batch can
+                    # make; 0 -> 0 moves compile each size.
+                    num_moves = 1
+                    while num_moves < 2 * bs * self.speculative_num_steps:
+                        no_op = np.zeros(num_moves, dtype=np.int32)
+                        copy_accepted_tree_kv(
+                            self.target_worker.model_runner.token_to_kv_pool, no_op, no_op
+                        )
+                        num_moves *= 2
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)
