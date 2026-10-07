@@ -698,11 +698,12 @@ class MHATokenToKVPool(KVCache):
     def replace_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
-    def copy_kv_rows(self, src: np.ndarray, dst: np.ndarray) -> None:
+    def copy_kv_rows(self, src: np.ndarray | jax.Array, dst: np.ndarray | jax.Array) -> None:
         """Copy every layer's KV at token slot ``src[i]`` to slot ``dst[i]``.
 
         All rows are read before any is written, so ``src`` and ``dst`` may
-        overlap. A pair with ``src[i] == dst[i]`` is a no-op.
+        overlap. A pair with ``src[i] == dst[i]`` is a no-op, and one whose
+        ``dst[i]`` is past the last slot is skipped.
         """
         kv_lock = getattr(self, "_donate_lock", None)
         lock_ctx = kv_lock if kv_lock is not None else contextlib.nullcontext()

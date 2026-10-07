@@ -57,6 +57,8 @@ class EagleTreeVerifyResult(NamedTuple):
     verified_id: jax.Array
     hidden_states: jax.Array
     positions: jax.Array
+    kv_copy_src: jax.Array
+    kv_copy_dst: jax.Array
 
 
 class FusedDraftExtendPendingResult(NamedTuple):
@@ -1512,8 +1514,9 @@ def _build_eagle3_tree_verify(num_steps: int, topk: int, num_draft_tokens: int):
     """Build EAGLE3 tree drafting, tree build and target verify as one JIT.
 
     The draft starts from the previous round's seeds (``topk_p``,
-    ``topk_index``, ``hidden_states``, ``verified_id``). Target KV of each
-    accepted path is moved to the front of its verify window before return.
+    ``topk_index``, ``hidden_states``, ``verified_id``). The result carries
+    the target KV slot copies that move each accepted path to the front of
+    its verify window; the caller applies them to the returned pools.
     """
     assert topk > 1, "Fused EAGLE3 tree verify needs topk > 1"
     assert num_steps > 1, "Fused EAGLE3 tree verify needs num_steps > 1"
@@ -1524,7 +1527,6 @@ def _build_eagle3_tree_verify(num_steps: int, topk: int, num_draft_tokens: int):
     from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import (
         verify_tree_greedy,
     )
-    from sgl_jax.srt.mem_cache.memory_pool import copy_kv_rows_in_jit
     from sgl_jax.srt.speculative.eagle_draft_worker import (
         select_top_k_tokens,
         topk_probs_from_logits,
@@ -1685,21 +1687,15 @@ def _build_eagle3_tree_verify(num_steps: int, topk: int, num_draft_tokens: int):
         )
         accept_lens = accept_lens + 1
 
-        kv_buffers = target_pool_updates["token_to_kv_pool"]
-        src, dst = accepted_path_kv_copies_device(
+        kv_buffer = target_pool_updates["token_to_kv_pool"][0]
+        kv_copy_src, kv_copy_dst = accepted_path_kv_copies_device(
             accept_index,
             jax.sharding.reshard(verify_seq_lens, P()),
             jax.sharding.reshard(verify_metadata.page_indices, P()),
             jax.sharding.reshard(verify_metadata.cu_kv_lens, P()),
             draft_token_num=n,
             page_size=page_size,
-            num_slots=kv_buffers[0].shape[0] * kv_buffers[0].shape[1],
-        )
-        target_pool_updates["token_to_kv_pool"] = copy_kv_rows_in_jit(
-            kv_buffers,
-            src,
-            dst,
-            target_memory_pools.token_to_kv_pool.kv_sharding.spec,
+            num_slots=kv_buffer.shape[0] * kv_buffer.shape[1],
         )
 
         flat_accept_index = accept_index.reshape(-1)
@@ -1716,6 +1712,8 @@ def _build_eagle3_tree_verify(num_steps: int, topk: int, num_draft_tokens: int):
                 verified_id=accepted_id,
                 hidden_states=target_hidden.at[safe_index].get(),
                 positions=positions.at[safe_index].get(),
+                kv_copy_src=kv_copy_src,
+                kv_copy_dst=kv_copy_dst,
             ),
         )
 
@@ -3129,6 +3127,9 @@ def launch_eagle3_tree_verify(spec_worker, model_worker_batch, cur_allocate_lens
         cache_miss_count = count()
     target_mr.memory_pools.replace_all(target_pool_updates)
     draft_mr.memory_pools.replace_all(draft_pool_updates)
+    # Its own JIT: inside the verify JIT, XLA relayouts every KV buffer
+    # around the scatter, copying the whole pool to move a few rows.
+    target_mr.token_to_kv_pool.copy_kv_rows(result.kv_copy_src, result.kv_copy_dst)
 
     next_draft_input = EagleDraftInput(
         verified_id=result.verified_id,
