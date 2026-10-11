@@ -638,5 +638,81 @@ class TestGDNProjectionsUnderTP(unittest.TestCase):
         return got, want, hlo
 
 
+class TestSharedExpertUnderTP(unittest.TestCase):
+    """The MoE block's shared expert stays whole on every device: the loader
+    maps its weights unsplit, and on a tensor axis of 2 its gated output equals
+    the dense reference with no collective."""
+
+    def test_whole_on_every_device(self):
+        if len(jax.devices()) < 2:
+            self.skipTest("needs 2 devices (JAX_NUM_CPU_DEVICES=2)")
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
+
+        cfg = _make_config(num_layers=4, is_moe=True)
+        mappings, _, _ = _create_qwen3_5_weight_mappings(cfg, _mapping_head(cfg))
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            spec = mappings[f"model.language_model.layers.0.mlp.shared_expert.{proj}.weight"]
+            self.assertEqual(tuple(spec.sharding), (None, None), proj)
+
+        got, want, specs, hlo = self._shared(cfg)
+        self.assertEqual(specs, [P(None, None)] * 3)
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-5)
+        for op in ("collective-permute", "all-gather", "all-to-all", "all-reduce"):
+            self.assertIsNone(re.search(rf"\b{op}(-start)?\(", hlo), op)
+
+    @staticmethod
+    def _shared(cfg):
+        """The block's gated shared expert on 2 devices; returns its output, the
+        NumPy reference, the three weights' shardings and the compiled HLO."""
+        from flax import nnx
+        from jax.sharding import AxisType, Mesh, NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.models.qwen3_5 import Qwen3_5MoeBlock
+
+        tc = cfg.text_config
+        H, inter = tc.hidden_size, tc.shared_expert_intermediate_size
+        rng = np.random.default_rng(0)
+        mesh = Mesh(
+            np.array(jax.devices()[:2]).reshape(1, 2),
+            ("data", "tensor"),
+            axis_types=(AxisType.Explicit, AxisType.Explicit),
+        )
+        weights = {
+            name: rng.standard_normal(shape).astype(np.float32) * 0.05
+            for name, shape in (
+                ("gate_proj", (H, inter)),
+                ("up_proj", (H, inter)),
+                ("down_proj", (inter, H)),
+                ("gate", (H, 1)),
+            )
+        }
+        x_np = rng.standard_normal((8, H)).astype(np.float32)
+        with jax.set_mesh(mesh):
+            block = Qwen3_5MoeBlock(cfg, mesh, layer_id=0, dtype=jnp.float32)
+            projections = [getattr(block.shared_experts, n) for n in weights if n != "gate"]
+            projections.append(block.shared_expert_gate)
+            specs = [p.weight.value.sharding.spec for p in projections[:3]]
+            for proj, value in zip(projections, weights.values()):  # each in its own sharding
+                proj.weight.value = jax.device_put(value, proj.weight.value.sharding)
+            x = jax.device_put(x_np, NamedSharding(mesh, P("data", None)))
+            graphdef, state = nnx.split(block)
+
+            def shared(state, x):
+                b = nnx.merge(graphdef, state)
+                gate_logit, _ = b.shared_expert_gate(x)
+                return jax.nn.sigmoid(gate_logit) * b.shared_experts(x)
+
+            fn = jax.jit(shared)
+            got = np.asarray(fn(state, x))
+            hlo = fn.lower(state, x).compile().as_text()
+        gate, up = x_np @ weights["gate_proj"], x_np @ weights["up_proj"]
+        mlp = (gate / (1 + np.exp(-gate)) * up) @ weights["down_proj"]
+        want = mlp / (1 + np.exp(-(x_np @ weights["gate"])))
+        return got, want, specs, hlo
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,7 +27,12 @@ init_fn = nnx.initializers.uniform()
 
 
 class Qwen2MoeMLP(nnx.Module):
-    """Qwen2 MoE MLP layer with gate, up, and down projections."""
+    """Qwen2 MoE MLP layer with gate, up, and down projections.
+
+    ``tensor_parallel=False`` keeps every projection whole on each device: the
+    layer then needs no collective, and each device holds and reads all of its
+    weights.
+    """
 
     def __init__(
         self,
@@ -37,13 +42,17 @@ class Qwen2MoeMLP(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
         gate_up_down_bias: bool | None = False,
+        tensor_parallel: bool = True,
     ) -> None:
         self.layer_id = layer_id
+        column, row = (
+            ((None, "tensor"), ("tensor", None)) if tensor_parallel else ((None, None),) * 2
+        )
 
         self.gate_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
-            kernel_axes=(None, "tensor"),
+            kernel_axes=column,
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
             mesh=mesh,
@@ -52,7 +61,7 @@ class Qwen2MoeMLP(nnx.Module):
         self.up_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
-            kernel_axes=(None, "tensor"),
+            kernel_axes=column,
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
             mesh=mesh,
@@ -61,7 +70,7 @@ class Qwen2MoeMLP(nnx.Module):
         self.down_proj = LinearBase(
             input_size=intermediate_size,
             output_size=hidden_size,
-            kernel_axes=("tensor", None),
+            kernel_axes=row,
             use_bias=gate_up_down_bias,
             params_dtype=dtype,
             mesh=mesh,

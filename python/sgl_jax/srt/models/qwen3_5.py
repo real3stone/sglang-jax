@@ -433,7 +433,9 @@ class Qwen3_5MoeBlock(nnx.Module):
             renormalize_topk_logits=renorm,
             quantization_config=getattr(config, "quantization_config", None),
         )
-        # Dense shared expert (always present for 35B-A3B) gated per-token.
+        # Dense shared expert (always present for 35B-A3B) gated per-token. It is
+        # small enough to keep whole on every device, which spares the all-reduce
+        # a tensor-parallel split would take in every MoE layer.
         self.shared_experts = Qwen2MoeMLP(
             hidden_size=hidden,
             intermediate_size=se_inter,
@@ -441,6 +443,7 @@ class Qwen3_5MoeBlock(nnx.Module):
             layer_id=layer_id,
             dtype=dtype,
             gate_up_down_bias=False,
+            tensor_parallel=False,
         )
         self.shared_expert_gate = LinearBase(
             input_size=hidden,
@@ -1031,17 +1034,17 @@ def _create_qwen3_5_weight_mappings(hf_config, lm_head: ParallelLMHead | None = 
         )
         mappings[f"{src}.mlp.shared_expert.gate_proj.weight"] = WeightSpec(
             target_path=f"{dst}.mlp.shared_experts.gate_proj.weight",
-            sharding=(None, "tensor"),
+            sharding=(None, None),
             transpose=True,
         )
         mappings[f"{src}.mlp.shared_expert.up_proj.weight"] = WeightSpec(
             target_path=f"{dst}.mlp.shared_experts.up_proj.weight",
-            sharding=(None, "tensor"),
+            sharding=(None, None),
             transpose=True,
         )
         mappings[f"{src}.mlp.shared_expert.down_proj.weight"] = WeightSpec(
             target_path=f"{dst}.mlp.shared_experts.down_proj.weight",
-            sharding=("tensor", None),
+            sharding=(None, None),
             transpose=True,
         )
         mappings[f"{src}.mlp.shared_expert_gate.weight"] = WeightSpec(
