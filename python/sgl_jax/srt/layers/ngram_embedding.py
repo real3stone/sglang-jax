@@ -257,6 +257,86 @@ def compute_ngram_ids(
     return ids.reshape(num_tokens, ctx_len * per_order)  # [T, HEADS]
 
 
+def _mul_words(token: jax.Array, multiplier: int) -> tuple[jax.Array, jax.Array]:
+    """Low and high u32 words of ``token * multiplier`` modulo 2**64, built
+    from 16-bit halves so that no partial product overflows u32."""
+    token = token.astype(jnp.uint32)
+    a, b = token & 65535, token >> 16
+    c, d = jnp.uint32(multiplier & 65535), jnp.uint32((multiplier >> 16) & 65535)
+    w0 = a * c
+    t = b * c + (w0 >> 16)
+    w1 = a * d + (t & 65535)
+    lo = (w1 << 16) | (w0 & 65535)
+    hi = b * d + (t >> 16) + (w1 >> 16) + token * jnp.uint32(multiplier >> 32)
+    return lo, hi
+
+
+def _remainder(n: jax.Array, p: jax.Array) -> jax.Array:
+    """``n % p`` for ``0 <= n < 128 * p`` and ``p < 2**25``: an f32 quotient
+    estimate, off by less than one, then one correction each way."""
+    q = (n.astype(jnp.float32) / p.astype(jnp.float32)).astype(jnp.uint32)
+    product = q * p
+    r = n - product
+    r = jnp.where(n < product, r + p, r)
+    return jnp.where(r >= p, r - p, r)
+
+
+def compute_ngram_ids_jax(
+    input_ids: jax.Array,  # [T]
+    context: jax.Array,  # [B, ctx_len]  tokens before each chunk, oldest first
+    params: NGramHashParams,
+    cu_seqlens: jax.Array | None = None,  # [B+1]; None: one token per request
+) -> jax.Array:  # [T, HEADS] int32
+    """``compute_ngram_ids`` on the device, bit for bit.
+
+    The products need 64 bits, so each is carried as two u32 words and
+    reduced modulo every head's prime a few bits at a time, keeping all
+    intermediates under 2**32. That needs primes below 2**25.
+    """
+    if int(params.sizes.max()) >= 2**25 or params.total_vocab_size >= 2**31:
+        raise ValueError("the device hash needs primes below 2**25 and fewer than 2**31 rows")
+    ctx_len = params.ngram_context_len
+    per_order = params.heads_per_ngram
+    tokens = input_ids.astype(jnp.int32)
+    position = jnp.arange(tokens.shape[0])
+    num_reqs = context.shape[0]
+    if cu_seqlens is None:
+        request = jnp.minimum(position, num_reqs - 1)
+        chunk_pos = jnp.zeros_like(position)
+    else:
+        request = jnp.clip(
+            jnp.searchsorted(cu_seqlens, position, side="right") - 1, 0, num_reqs - 1
+        )
+        chunk_pos = position - cu_seqlens[request]
+    sizes = np.asarray(params.sizes, np.uint32).reshape(ctx_len, per_order)
+    offsets = np.asarray(params.offsets, np.uint32).reshape(ctx_len, per_order)
+
+    lo, hi = _mul_words(tokens, int(params.multipliers[0]))
+    crossed = jnp.zeros(tokens.shape, bool)
+    ids = []
+    for shift in range(1, ctx_len + 1):
+        previous = jnp.where(
+            chunk_pos >= shift,
+            tokens[jnp.maximum(position - shift, 0)],
+            context[request, jnp.clip(ctx_len - shift + chunk_pos, 0, ctx_len - 1)],
+        )
+        previous = jnp.where(crossed, params.eos_token_id, previous)
+        crossed |= previous == params.eos_token_id
+        next_lo, next_hi = _mul_words(previous, int(params.multipliers[shift]))
+        lo, hi = lo ^ next_lo, hi ^ next_hi
+        # The order-(shift+1) hash, reduced by heads [shift-1]: each word is
+        # consumed as 4 + 7 + 7 + 7 + 7 bits.
+        p = jnp.asarray(sizes[shift - 1])[None, :]  # [1, hpn]
+        residue = jnp.zeros((tokens.shape[0], per_order), jnp.uint32)
+        for word in (hi, lo):
+            word = word[:, None]
+            residue = _remainder((residue << 4) | (word >> 28), p)
+            for bits in (21, 14, 7, 0):
+                residue = _remainder((residue << 7) | ((word >> bits) & 127), p)
+        ids.append((residue + jnp.asarray(offsets[shift - 1])[None, :]).astype(jnp.int32))
+    return jnp.concatenate(ids, axis=1)  # [T, HEADS]
+
+
 # --- device layer ----------------------------------------------------------
 
 

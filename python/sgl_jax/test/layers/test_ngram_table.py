@@ -6,17 +6,30 @@ naming and split, so it runs on a CPU runner without the 95.4 GiB table.
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("JAX_NUM_CPU_DEVICES", "2")
+
+import jax
+import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+from jax.sharding import AxisType, Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.ngram_embedding import build_hash_params
-from sgl_jax.srt.layers.ngram_table import NGramTable, shard_placements
+from sgl_jax.srt.layers.ngram_table import (
+    NGramTable,
+    device_rows,
+    gather_on_device,
+    shard_placements,
+)
 from sgl_jax.test.test_utils import CustomTestCase
 
 PREFIX = "model.language_model.layers.1.ple.ple_embedding"
@@ -278,6 +291,45 @@ class TestLoadAndGather(CustomTestCase):
                     path.write_text(json.dumps(metadata))
                 with self.assertRaises(ValueError):
                     NGramTable.from_cache(cache)
+
+
+class TestDeviceTable(CustomTestCase):
+    def test_the_device_lookup_matches_the_host_gather(self):
+        """Rows split over the tensor axis, each device answering for its own
+        range: every id, on either side of the split and at the last padded
+        row, must come back as the host gather returns it, for bf16 rows and
+        for FP8 rows with their scale."""
+        n = min(2, len(jax.devices()))
+        mesh = Mesh(
+            np.array(jax.devices()[:n]).reshape(1, n),
+            ("data", "tensor"),
+            axis_types=(AxisType.Explicit, AxisType.Explicit),
+        )
+        params = _params()
+        padded = ((params.total_vocab_size + 127) // 128) * 128
+        rng = np.random.default_rng(0)
+        half = padded // n
+        edges = [0, half - 1, min(half, padded - 1), padded - 1]  # half == padded on one device
+        ids = np.r_[edges, rng.integers(0, params.total_vocab_size, 8)]
+        ids = ids.astype(np.int32).reshape(-1, HEADS)
+        for dtype, scale in (("bfloat16", 1.0), ("float8_e4m3fn", 0.375)):
+            with self.subTest(dtype=dtype):
+                table = NGramTable(params, DIM, padded_rows=padded, dtype=dtype, scale=scale)
+                if dtype == "bfloat16":
+                    values = rng.standard_normal(table.data.shape).astype(ml_dtypes.bfloat16)
+                    table.data[:] = values.view(np.uint16)
+                else:
+                    table.data[:] = _fp8_rows(rng.integers(0, 1 << 20, table.data.shape))
+                with jax.set_mesh(mesh):
+                    got = gather_on_device(
+                        device_rows(table, mesh),
+                        jax.device_put(ids, NamedSharding(mesh, P("data", None))),
+                        jnp.float32(scale),
+                        mesh,
+                    )
+                np.testing.assert_array_equal(
+                    np.asarray(got).view(np.uint16), table.gather(ids).view(np.uint16)
+                )
 
 
 class TestSchedulerHandoff(CustomTestCase):

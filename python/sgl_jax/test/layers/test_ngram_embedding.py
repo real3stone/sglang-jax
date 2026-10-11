@@ -10,6 +10,7 @@ from sgl_jax.srt.layers.ngram_embedding import (
     NGramEmbedding,
     build_hash_params,
     compute_ngram_ids,
+    compute_ngram_ids_jax,
     ngram_context_row,
     ngram_context_row_split,
 )
@@ -194,6 +195,43 @@ class TestComputeNGramIds(CustomTestCase):
                             np.all((got >= params.offsets) & (got < params.offsets + params.sizes))
                         )
                         np.testing.assert_array_equal(ctx, original_ctx)
+
+    def test_the_device_hash_matches_the_host_one(self):
+        """The device hash carries each 64-bit product as two u32 words. It
+        must give the host hash's ids exactly: for decode batches and ragged
+        extends, across EOS barriers, at the largest token id, and with the
+        released table's primes, which sit just under the 2**25 it allows."""
+        for ngram_size, heads, vocab, base in (
+            (3, 8, 248320, 20_000_000),
+            (3, 2, VOCAB, 1000),
+            (4, 2, VOCAB, 1000),
+        ):
+            params = _params(
+                ngram_size=ngram_size,
+                heads_per_ngram=heads,
+                vocab_size=vocab,
+                ngram_vocab_size_base=base,
+            )
+            for lens in ([1] * 6, [5, 1, 9], [0, 1, 3, 0], [3, 2, 0, 0]):
+                for eos in (False, True):
+                    with self.subTest(base=base, ngram_size=ngram_size, lens=lens, eos=eos):
+                        rng = np.random.default_rng(SEED)
+                        cu = np.r_[0, np.cumsum(lens)]
+                        ids = rng.integers(0, vocab, size=int(cu[-1]))
+                        ctx = rng.integers(0, vocab, size=(len(lens), ngram_size - 1))
+                        ids[0] = vocab - 1
+                        if eos:
+                            ids[1::3] = EOS
+                            ctx[:, -1] = EOS
+                        want = compute_ngram_ids(ids, cu, ctx, params)
+                        decode = all(n == 1 for n in lens)
+                        got = compute_ngram_ids_jax(
+                            jnp.asarray(ids, jnp.int32),
+                            jnp.asarray(ctx, jnp.int32),
+                            params,
+                            None if decode else jnp.asarray(cu, jnp.int32),
+                        )
+                        np.testing.assert_array_equal(np.asarray(got), want)
 
     def test_chunk_boundaries_preserve_hashes(self):
         params = _params()

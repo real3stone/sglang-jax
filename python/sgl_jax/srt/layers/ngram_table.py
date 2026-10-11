@@ -16,8 +16,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.ngram_embedding import NGramHashParams, build_hash_params
 
@@ -348,6 +352,54 @@ class NGramTable:
         return table
 
 
+# -- device-resident table -----------------------------------------------------
+#
+# Where HBM holds it -- a v7x device has 96 GiB, the FP8 table is 6 GiB per
+# device over 8 -- the table lives on the device, row-sharded over the tensor
+# axis, and the model looks it up itself. The host then never needs the
+# step's tokens, which is what overlap scheduling withholds.
+
+
+def device_rows(table: NGramTable, mesh: jax.sharding.Mesh) -> jax.Array:
+    """The table's rows on the device, split by rows over the tensor axis."""
+    return jax.device_put(table.data, NamedSharding(mesh, P("tensor", None)))
+
+
+def gather_on_device(
+    rows: jax.Array,  # [padded_rows, dim] row bytes, P("tensor", None)
+    ids: jax.Array,  # [T, HEADS] int32, P("data", None)
+    scale: jax.Array,  # [] float32; 1 for bf16 rows
+    mesh: jax.sharding.Mesh,
+) -> jax.Array:  # [T, HEADS * dim] bf16, P("data", None)
+    """:meth:`NGramTable.gather` against :func:`device_rows`.
+
+    Each device looks up the ids inside its own row range and zeroes the
+    rest, so the sum over the tensor axis has one nonzero term per row and
+    is exact.
+    """
+
+    def local(rows_l, ids_l, scale_l):
+        n = rows_l.shape[0]
+        local_ids = ids_l - jax.lax.axis_index("tensor") * n
+        hit = (local_ids >= 0) & (local_ids < n)
+        raw = jnp.take(rows_l, jnp.where(hit, local_ids, 0), axis=0)  # [T, HEADS, dim]
+        if raw.dtype == jnp.uint8:
+            values = jax.lax.bitcast_convert_type(raw, jnp.float8_e4m3fn).astype(jnp.float32)
+            values = (values * scale_l).astype(jnp.bfloat16)
+        else:
+            values = jax.lax.bitcast_convert_type(raw, jnp.bfloat16)
+        values = jnp.where(hit[..., None], values, jnp.zeros((), jnp.bfloat16))
+        return jax.lax.psum(values, "tensor").reshape(ids_l.shape[0], -1)
+
+    return jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(P("tensor", None), P("data", None), P()),
+        out_specs=P("data", None),
+        check_vma=False,
+    )(rows, ids, scale)
+
+
 _MADV_RANDOM = 1
 
 
@@ -429,6 +481,8 @@ def get_ngram_table() -> NGramTable | None:
 __all__ = [
     "NGramTable",
     "ShardPlacement",
+    "device_rows",
+    "gather_on_device",
     "get_ngram_table",
     "set_ngram_table",
     "shard_placements",
