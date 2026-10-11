@@ -1,4 +1,5 @@
-"""Host-resident PLE table: 320,001,446 rows x 160 bf16 = 95.4 GiB.
+"""Host-resident PLE table: 320,001,446 rows x 160, 95.4 GiB in bf16 or
+47.7 GiB in the FP8 checkpoint's float8_e4m3fn with one per-table scale.
 
 It does not fit in v6e HBM, and XLA:TPU cannot gather from a pinned_host
 array, so the host gathers 16 rows per token and only [T, 16*160] crosses to
@@ -25,7 +26,11 @@ logger = logging.getLogger(__name__)
 _ROWS_PER_THREAD = 1024  # 128 rows -> 1t, 4,096 -> 4t, 131,072 -> 32t
 _MAX_THREADS = 32  # past this the box fights itself
 
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
+
+# Storage per checkpoint dtype: the row bytes as unsigned integers, since the
+# gather is pure byte movement.
+_STORAGE = {"bfloat16": np.uint16, "float8_e4m3fn": np.uint8}
 
 
 def _thread_count(rows: int, cap: int | None = None) -> int:
@@ -60,19 +65,42 @@ def shard_placements(total_rows: int, split_parts: int) -> list[ShardPlacement]:
 
 
 class NGramTable:
-    """data [padded_rows, dim] uint16 -- numpy has no bfloat16 and the gather
-    is pure byte movement; :meth:`gather` views the result back to bfloat16."""
+    """data [padded_rows, dim] as raw row bytes: uint16 for bfloat16 rows,
+    uint8 for float8_e4m3fn rows. :meth:`gather` always returns bfloat16; FP8
+    rows are dequantized through a 256-entry table with the scale folded in."""
 
-    def __init__(self, params: NGramHashParams, dim: int, padded_rows: int | None = None):
+    def __init__(
+        self,
+        params: NGramHashParams,
+        dim: int,
+        padded_rows: int | None = None,
+        dtype: str = "bfloat16",
+        scale: float = 1.0,
+    ):
+        if dtype not in _STORAGE:
+            raise ValueError(f"unsupported N-gram table dtype {dtype!r}")
         self.params = params
         self.dim = int(dim)
+        self.dtype = dtype
+        self.scale = float(scale)
+        # fp8 bit pattern -> bf16 bit pattern of value * scale
+        self._dequant = (
+            (
+                np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+                * np.float32(self.scale)
+            )
+            .astype(ml_dtypes.bfloat16)
+            .view(np.uint16)
+            if dtype == "float8_e4m3fn"
+            else None
+        )
         self.rows = int(params.total_vocab_size)
         self.padded_rows = int(padded_rows) if padded_rows else self.rows
         if self.padded_rows < self.rows:
             raise ValueError(
                 f"padded_rows {self.padded_rows} is smaller than the table's {self.rows}"
             )
-        self.data = np.zeros((self.padded_rows, self.dim), dtype=np.uint16)
+        self.data = np.zeros((self.padded_rows, self.dim), dtype=_STORAGE[dtype])
         self._pool: ThreadPoolExecutor | None = None
         logger.info(
             "N-gram table allocated: %s rows x %d = %.1f GiB host RAM",
@@ -99,9 +127,17 @@ class NGramTable:
         flat_ids = ids.reshape(-1)  # [T*HEADS]
         flat_out = out.reshape(-1, self.dim)  # [T*HEADS, dim]
 
+        def gather_rows(lo: int, hi: int) -> None:
+            if self._dequant is None:
+                np.take(self.data, flat_ids[lo:hi], axis=0, out=flat_out[lo:hi])
+            else:
+                np.take(
+                    self._dequant, np.take(self.data, flat_ids[lo:hi], axis=0), out=flat_out[lo:hi]
+                )
+
         nthreads = _thread_count(flat_ids.shape[0])
         if nthreads == 1:
-            np.take(self.data, flat_ids, axis=0, out=flat_out)
+            gather_rows(0, flat_ids.shape[0])
         else:
             if self._pool is None:
                 self._pool = ThreadPoolExecutor(
@@ -109,15 +145,7 @@ class NGramTable:
                 )
             bounds = np.linspace(0, flat_ids.shape[0], nthreads + 1).astype(int)
             list(  # np.take drops the GIL, so these actually overlap
-                self._pool.map(
-                    lambda k: np.take(
-                        self.data,
-                        flat_ids[bounds[k] : bounds[k + 1]],
-                        axis=0,
-                        out=flat_out[bounds[k] : bounds[k + 1]],
-                    ),
-                    range(nthreads),
-                )
+                self._pool.map(lambda k: gather_rows(bounds[k], bounds[k + 1]), range(nthreads))
             )
         return out.reshape(num_tokens, heads * self.dim).view(ml_dtypes.bfloat16)
 
@@ -130,8 +158,13 @@ class NGramTable:
                 f"shard {placement.index}: expected {(placement.rows, self.dim)}, "
                 f"got {tuple(weight.shape)}"
             )
+        storage = _STORAGE[self.dtype]
+        if weight.dtype.itemsize != np.dtype(storage).itemsize:
+            raise ValueError(
+                f"shard {placement.index}: {weight.dtype} rows in a {self.dtype} table"
+            )
         dst = self.data[placement.start : placement.start + placement.rows]  # [rows, dim]
-        dst[:] = weight.view(np.uint16) if weight.dtype != np.uint16 else weight
+        dst[:] = weight.view(storage)
 
     @classmethod
     def from_safetensors(
@@ -157,7 +190,14 @@ class NGramTable:
         divisor = int(config.make_ngram_vocab_size_divisible_by)  # 128
         padded = ((params.total_vocab_size + divisor - 1) // divisor) * divisor  # 320,001,536
         dim = int(config.ple_embed_dim) // params.ngram_heads  # 2560 // 16 = 160
-        table = cls(params, dim, padded_rows=padded)
+        # The FP8 checkpoint ships one scale for the whole table.
+        scale_name = f"{prefix}.ngram_embedding.weight_scale"
+        if scale_name in weight_files:
+            scale = _read_raw(weight_files[scale_name], scale_name)
+            scale = float(scale.view(ml_dtypes.bfloat16).astype(np.float32).reshape(-1)[0])
+            table = cls(params, dim, padded_rows=padded, dtype="float8_e4m3fn", scale=scale)
+        else:
+            table = cls(params, dim, padded_rows=padded)
 
         # Group by file so each one is opened once, in index order.
         placements = shard_placements(table.padded_rows, int(config.split_ngram_parts))
@@ -170,12 +210,18 @@ class NGramTable:
 
         done = 0
         for path, group in by_file.items():
-            with safe_open(path, framework="np") as f:
+            if table.dtype == "float8_e4m3fn":
                 for p in group:
-                    table.load_shard(
-                        p, f.get_tensor(f"{prefix}.ngram_embedding.shard_{p.index}.weight")
-                    )
+                    name = f"{prefix}.ngram_embedding.shard_{p.index}.weight"
+                    table.load_shard(p, _read_raw(path, name))
                     done += 1
+            else:
+                with safe_open(path, framework="np") as f:
+                    for p in group:
+                        table.load_shard(
+                            p, f.get_tensor(f"{prefix}.ngram_embedding.shard_{p.index}.weight")
+                        )
+                        done += 1
             logger.info("N-gram table: %d/%d shards", done, len(placements))
 
         table.verify_against_checkpoint(weight_files, prefix=prefix)
@@ -240,7 +286,8 @@ class NGramTable:
             "rows": self.rows,
             "padded_rows": self.padded_rows,
             "dim": self.dim,
-            "dtype": "bfloat16",
+            "dtype": self.dtype,
+            "scale": self.scale,
             "ngram_size": self.params.ngram_size,
             "heads_per_ngram": self.params.heads_per_ngram,
             "eos_token_id": self.params.eos_token_id,
@@ -251,11 +298,12 @@ class NGramTable:
 
     @classmethod
     def from_metadata(cls, meta: dict) -> NGramTable:
-        """Allocated but empty; fill with :meth:`read_into`."""
-        if meta["version"] != CACHE_FORMAT_VERSION:
+        """Allocated but empty; fill with :meth:`read_into`. Version 1 caches
+        are bfloat16 tables without a scale."""
+        if meta["version"] not in (1, CACHE_FORMAT_VERSION):
             raise ValueError(
                 f"N-gram table cache is version {meta['version']}, "
-                f"this build writes {CACHE_FORMAT_VERSION}"
+                f"this build reads 1 and {CACHE_FORMAT_VERSION}"
             )
         params = NGramHashParams(
             multipliers=np.array(meta["multipliers"], np.int64),
@@ -266,7 +314,13 @@ class NGramTable:
             ngram_size=meta["ngram_size"],
             eos_token_id=meta["eos_token_id"],
         )
-        return cls(params, meta["dim"], padded_rows=meta["padded_rows"])
+        return cls(
+            params,
+            meta["dim"],
+            padded_rows=meta["padded_rows"],
+            dtype=meta.get("dtype", "bfloat16"),
+            scale=meta.get("scale", 1.0),
+        )
 
     def save_cache(self, directory: str | Path) -> Path:
         """Flat file + json sidecar, restored with one sequential read."""
@@ -283,14 +337,13 @@ class NGramTable:
         meta = json.loads((directory / "ngram_table.json").read_text())
         table = cls.from_metadata(meta)
         path = directory / "ngram_table.bin"
-        want = table.padded_rows * table.dim * 2
+        storage = _STORAGE[table.dtype]
+        want = table.padded_rows * table.dim * np.dtype(storage).itemsize
         got = os.path.getsize(path)
         if got != want:
             raise ValueError(f"{path} is {got} bytes, expected {want}")
         # mmap: pages load lazily and the OS can evict them.
-        table.data = np.memmap(path, dtype=np.uint16, mode="r").reshape(
-            table.padded_rows, table.dim
-        )
+        table.data = np.memmap(path, dtype=storage, mode="r").reshape(table.padded_rows, table.dim)
         _madvise_random(table.data)
         return table
 
@@ -323,6 +376,30 @@ def _madvise_random(array: np.ndarray) -> bool:
     return True
 
 
+# safetensors dtype -> storage holding its raw bytes
+_RAW_DTYPES = {"BF16": np.uint16, "F8_E4M3": np.uint8, "F32": np.float32, "I64": np.int64}
+
+
+def _read_raw(path: str | Path, name: str) -> np.ndarray:
+    """One tensor's bytes from a safetensors file, as its storage integers.
+
+    safetensors' NumPy backend cannot return float8 arrays, so FP8 rows and
+    their bf16 scale are read straight from the file's header and offsets.
+    """
+    with open(path, "rb") as f:
+        (header_len,) = np.frombuffer(f.read(8), dtype="<u8")
+        header = json.loads(f.read(int(header_len)))
+        info = header.get(name)
+        if info is None:
+            raise KeyError(f"{path} has no tensor {name}")
+        if info["dtype"] not in _RAW_DTYPES:
+            raise ValueError(f"{name}: unsupported safetensors dtype {info['dtype']}")
+        start, end = info["data_offsets"]
+        f.seek(8 + int(header_len) + start)
+        data = np.frombuffer(f.read(end - start), dtype=_RAW_DTYPES[info["dtype"]])
+    return data.reshape(info["shape"])
+
+
 def _eos_token_id(config) -> int:
     eos = getattr(config, "eos_token_id", None)
     if isinstance(eos, (list, tuple)):
@@ -332,7 +409,7 @@ def _eos_token_id(config) -> int:
     return int(eos)
 
 
-# -- process-global handle: one 95 GiB table per process ---------------------
+# -- process-global handle: one table per process ----------------------------
 
 _TABLE: NGramTable | None = None
 

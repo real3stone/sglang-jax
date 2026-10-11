@@ -51,11 +51,19 @@ def _params():
     )
 
 
-def _write_checkpoint(directory, params, *, corrupt=None, drop_buffer=False):
+def _fp8_rows(rows):
+    """Row r's FP8 bit pattern in an ``fp8_scale`` checkpoint: r % 120, a
+    finite value."""
+    return (np.asarray(rows) % 120).astype(np.uint8)
+
+
+def _write_checkpoint(directory, params, *, corrupt=None, drop_buffer=False, fp8_scale=None):
     """Synthetic shards laid out exactly as the real checkpoint names them.
 
     Row r gets the constant value r % 65535 in every column, so a gather's
-    correctness is readable straight off the returned bits.
+    correctness is readable straight off the returned bits. With
+    ``fp8_scale`` the shards are float8_e4m3fn rows of ``_fp8_rows`` and the
+    table's one bf16 scale is written next to them, as in the FP8 checkpoint.
     """
     from safetensors.numpy import save_file
 
@@ -66,11 +74,20 @@ def _write_checkpoint(directory, params, *, corrupt=None, drop_buffer=False):
     weight_files = {}
     for index in range(SPLIT_PARTS):
         start = index * shard_rows
-        rows = (np.arange(start, start + shard_rows) % 65535).astype(np.uint16)
+        if fp8_scale is None:
+            rows = (np.arange(start, start + shard_rows) % 65535).astype(np.uint16)
+        else:
+            rows = _fp8_rows(np.arange(start, start + shard_rows)).view(ml_dtypes.float8_e4m3fn)
         tensor = np.repeat(rows[:, None], DIM, axis=1)
         name = f"{PREFIX}.ngram_embedding.shard_{index}.weight"
         path = Path(directory) / f"shard_{index}.safetensors"
         save_file({name: tensor}, str(path))
+        weight_files[name] = str(path)
+
+    if fp8_scale is not None:
+        name = f"{PREFIX}.ngram_embedding.weight_scale"
+        path = Path(directory) / "scale.safetensors"
+        save_file({name: np.array([fp8_scale], ml_dtypes.bfloat16)}, str(path))
         weight_files[name] = str(path)
 
     buffers = {
@@ -141,6 +158,46 @@ class TestLoadAndGather(CustomTestCase):
                     np.testing.assert_array_equal(
                         got.view(np.uint16).reshape(*ids.shape, DIM), want
                     )
+
+    def test_an_fp8_checkpoint_dequantizes_on_gather(self):
+        """The FP8 checkpoint's rows are float8_e4m3fn with one bf16 scale for
+        the table. They are stored as one byte each and come out of the
+        gather as bf16 of value * scale, from the checkpoint, the cache and a
+        stream alike."""
+        params, scale = _params(), 0.375
+        with tempfile.TemporaryDirectory() as directory:
+            table = NGramTable.from_safetensors(
+                _write_checkpoint(directory, params, fp8_scale=scale), _Config()
+            )
+            self.assertEqual((table.dtype, table.scale), ("float8_e4m3fn", scale))
+            self.assertEqual(table.data.nbytes, table.padded_rows * DIM)
+            cache = Path(directory) / "cache"
+            table.save_cache(cache)
+            restored = NGramTable.from_cache(cache)
+            stream = io.BytesIO()
+            self.assertEqual(table.write_to(stream), table.padded_rows * DIM)
+            streamed = NGramTable.from_metadata(table.metadata())
+            streamed.read_into(io.BytesIO(stream.getvalue()))
+
+            shard_rows = table.padded_rows // SPLIT_PARTS
+            boundaries = np.arange(1, SPLIT_PARTS) * shard_rows
+            ids = np.r_[0, table.rows - 1, boundaries - 1, boundaries].astype(np.int32)
+            ids = ids.reshape(-1, HEADS)
+            values = _fp8_rows(ids).view(ml_dtypes.float8_e4m3fn).astype(np.float32) * scale
+            want = np.repeat(values.astype(ml_dtypes.bfloat16)[:, :, None], DIM, axis=2)
+            for candidate in (table, restored, streamed):
+                got = candidate.gather(ids)
+                self.assertEqual(got.dtype, ml_dtypes.bfloat16)
+                np.testing.assert_array_equal(got.reshape(*ids.shape, DIM), want)
+
+    def test_a_version_1_cache_is_a_bf16_table(self):
+        """Caches written before tables carried a dtype hold bf16 rows."""
+        meta = NGramTable(_params(), DIM).metadata()
+        for key in ("dtype", "scale"):
+            del meta[key]
+        meta["version"] = 1
+        table = NGramTable.from_metadata(meta)
+        self.assertEqual((table.dtype, table.scale, table.data.dtype), ("bfloat16", 1.0, np.uint16))
 
     def test_gather_shapes_dtypes_and_output_reuse(self):
         for dim in (7, 64, 257):
