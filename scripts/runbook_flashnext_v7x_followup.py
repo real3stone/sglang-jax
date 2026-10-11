@@ -154,6 +154,11 @@ def capture_profile(
             run.log(f"  profile 等了 {PROFILE_WAIT_SECONDS} 秒没有自己停，已手动停止")
             break
         time.sleep(10)
+    return prune_profile(out)
+
+
+def prune_profile(out: Path) -> dict:
+    """超过 PROFILE_MAX_MB 时只留 xplane.pb；返回目录的概况，没有 xplane.pb 就抛异常。"""
     files = [p for p in out.rglob("*") if p.is_file()]
     if sum(p.stat().st_size for p in files) > PROFILE_MAX_MB * 2**20:
         for p in files:

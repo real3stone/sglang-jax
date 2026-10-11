@@ -185,6 +185,7 @@ DEFAULT_LAUNCH = {
     "max_running_requests": MAX_RUNNING_REQUESTS,
     "precompile_bs_paddings": (16,),
     "precompile_token_paddings": (16, 512, 1024),
+    "extra_args": (),
 }
 
 
@@ -211,6 +212,7 @@ def server_cmd(args, backend: str, launch: dict | None = None) -> list[str]:
         "--max-recurrent-state-size", running,
         "--disable-radix-cache",
         "--disable-overlap-schedule",
+        *cfg["extra_args"],
         "--skip-server-warmup",
         "--random-seed", "3",
         "--precompile-bs-paddings", *map(str, cfg["precompile_bs_paddings"]),
@@ -368,7 +370,10 @@ def host_mem_available_gib() -> float | None:
     return None
 
 
-def stage_c0(run: Run, args, stage: str = "C0", min_mem_gib: float | None = None) -> bool:
+def stage_c0(
+    run: Run, args, stage: str = "C0", min_mem_gib: float | None = None, extra_problems=()
+) -> bool:
+    """extra_problems 是调用方自己查出来的问题，和这里的一起记录、一起判定。"""
     run.log(f"===== {stage}：{STAGE_INFO[stage]}")
     problems = []
     mem_gib = host_mem_available_gib()
@@ -428,6 +433,7 @@ def stage_c0(run: Run, args, stage: str = "C0", min_mem_gib: float | None = None
                 " git fetch origin && git reset --hard origin/bringup/qwen4-exp-v7x"
             )
 
+    problems += extra_problems
     for p in problems:
         run.log(f"  问题：{p}")
     run.record(

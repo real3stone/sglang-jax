@@ -152,6 +152,7 @@ LAUNCH_PLE_ON = {
 LAUNCH_PLE_OFF = dict(rb.DEFAULT_LAUNCH)  # 和第一轮跑通测试相同
 EXPECTED_LOAD_SUMMARY_PLE = "consumed=1163, skipped=495, missing=0, unexpected=0"
 NGRAM_TABLE_LOADED = "N-gram table: 128/128 shards"
+NGRAM_ALLOCATED = "N-gram table allocated:"
 NGRAM_VERIFY_SKIPPED = "keeping the derived values"
 TUNED_CONFIG_USED = "Using tuned block config"
 READY_TIMEOUT_MIN = 1800  # PLE 打开的那次启动还要读 95 GiB 的 n-gram 表，就绪等待至少给这么久
@@ -197,6 +198,9 @@ RANK = {"PASS": 0, "WARN": 1, "FAIL": 2}
 
 # ---- 子进程 -------------------------------------------------------------------
 
+# worker 子进程从这份文件启动。调用方会切换代码时，换成不受切换影响的副本
+WORKER_SCRIPT = Path(__file__).resolve()
+
 
 def run_worker(run, args, kind: str, spec: dict, name: str, srv=None, timeout=None) -> dict:
     """在子进程里跑本脚本的一个 worker，返回它写出的 JSON；失败时返回 {"error": ...}。"""
@@ -208,7 +212,7 @@ def run_worker(run, args, kind: str, spec: dict, name: str, srv=None, timeout=No
         "out": str(run.out.resolve()),
         "result": str(result.resolve()),
     }
-    cmd = [sys.executable, str(Path(__file__).resolve()), "--_worker", kind, json.dumps(spec)]
+    cmd = [sys.executable, str(WORKER_SCRIPT), "--_worker", kind, json.dumps(spec)]
     rc = rb.run_logged(args, cmd, run.out / f"{name}.log", srv=srv, timeout=timeout)
     if rc != 0 or not result.exists():
         return {"error": f"返回码 {rc}，请查看 {name}.log"}
@@ -279,6 +283,9 @@ def worker_moe_check(spec: dict) -> dict:
     # _test_moe 构造分块配置时不传 bts，kernel 就用 bts=bt；服务端用的是调好的 bts。
     # 让测试里那个名字带上调好的 bts，检查的才是写进调优表的那一组分块。
     moe_test.FusedMoEBlockConfig = functools.partial(moe_test.FusedMoEBlockConfig, bts=spec["bts"])
+    quant = {}
+    if spec.get("w_dtype"):
+        quant = {"w_dtype": getattr(jnp, spec["w_dtype"]), "quant_block_k": spec["quant_block_k"]}
     case = moe_test.MoEKernelTest()
     case.setUp()
     try:
@@ -295,6 +302,7 @@ def worker_moe_check(spec: dict) -> dict:
             act_fn="silu",
             atol=5e-2,
             rtol=5e-2,
+            **quant,
             **spec["blocks"],
         )
     finally:
@@ -304,6 +312,7 @@ def worker_moe_check(spec: dict) -> dict:
 
 def worker_eval(spec: dict) -> dict:
     """跑一次 MMLU / GPQA，记下每个请求的 finish_reason、输出 token 数和抽到的答案。"""
+    import hashlib
     import threading
 
     sys.path.insert(0, str(Path(spec["repo"], "test", "srt")))
@@ -311,6 +320,7 @@ def worker_eval(spec: dict) -> dict:
     from eval.simple_eval_common import (
         ANSWER_PATTERN_MULTICHOICE,
         ChatCompletionSampler,
+        format_multichoice_question,
         make_report,
         set_ulimit,
         strip_reasoning,
@@ -321,10 +331,11 @@ def worker_eval(spec: dict) -> dict:
     set_ulimit()
 
     class RecordingSampler(ChatCompletionSampler):
-        def __init__(self, **kwargs):
+        def __init__(self, answers: dict, **kwargs):
             super().__init__(**kwargs)
             self.client = self.client.with_options(timeout=EVAL_REQUEST_TIMEOUT, max_retries=0)
             self.calls, self.lock = [], threading.Lock()
+            self.answers = answers  # 题面 -> 标准答案，用来逐题对比两次运行
 
         def __call__(self, message_list):
             kwargs = dict(
@@ -337,6 +348,11 @@ def worker_eval(spec: dict) -> dict:
                 kwargs["top_p"] = self.top_p
             if self.extra_body:
                 kwargs["extra_body"] = self.extra_body
+            prompt = message_list[-1]["content"]
+            question = {
+                "question": hashlib.sha1(prompt.encode()).hexdigest()[:12],
+                "answer": self.answers.get(prompt),
+            }
             text, record = "", {}
             for attempt in range(EVAL_RETRIES):
                 try:
@@ -355,7 +371,8 @@ def worker_eval(spec: dict) -> dict:
                 text = choice.message.content or ""
                 reasoning = getattr(choice.message, "reasoning_content", None)
                 if reasoning:
-                    text = f"{reasoning}\n{text}"
+                    # strip_reasoning 靠 </think> 去掉思考，没有它答案会从思考过程里抽
+                    text = f"{reasoning}\n</think>\n{text}"
                 match = re.search(ANSWER_PATTERN_MULTICHOICE, strip_reasoning(text))
                 record = {
                     "finish_reason": choice.finish_reason,
@@ -364,23 +381,26 @@ def worker_eval(spec: dict) -> dict:
                 }
                 break
             with self.lock:
-                self.calls.append(record)
+                self.calls.append({**question, **record})
             return text
 
     if spec["eval"] == "mmlu":
         from eval.simple_eval_mmlu import MMLUEval
 
         eval_obj = MMLUEval(MMLU_URL, spec["num_examples"], spec["threads"])
+        answers = {format_multichoice_question(row): row["Answer"] for row in eval_obj.examples}
     else:
         from eval.simple_eval_gpqa import GPQAEval
 
         eval_obj = GPQAEval(GPQA_URL, spec["num_examples"], spec["threads"])
+        answers = {}  # GPQA 只比分数，不逐题对比
     sampling = dict(spec["sampling"])
     extra = {
         k: sampling.pop(k) for k in ("top_k", "min_p", "presence_penalty", "repetition_penalty")
     }
     extra.update(seed=spec["seed"], chat_template_kwargs={"enable_thinking": True})
     sampler = RecordingSampler(
+        answers,
         base_url=f"{spec['base_url']}/v1",
         model=spec["model"],
         temperature=sampling["temperature"],
@@ -464,9 +484,14 @@ def stage_p1(run: rb.Run, args) -> None:
 
 
 def stage_p2(run: rb.Run, args) -> None:
-    run.log(f"===== P2：{STAGE_INFO['P2']}")
-    log = run.out / "p2_moe_tune.log"
-    rc = rb.run_logged(args, [sys.executable, *MOE_TUNE_ARGS], log, timeout=MOE_TUNE_TIMEOUT)
+    tune_moe(run, args, "P2", MOE_TUNE_ARGS, MOE_TOKENS, "moe_tuned.json")
+
+
+def tune_moe(run: rb.Run, args, stage: str, tune_args, tokens, name: str) -> None:
+    """跑 bench_fused_moe 调参，把输出里的 tuned_table 行解析成 name 这份 JSON。"""
+    run.log(f"===== {stage}：{rb.STAGE_INFO[stage]}")
+    log = run.out / f"{stage.lower()}_moe_tune.log"
+    rc = rb.run_logged(args, [sys.executable, *tune_args], log, timeout=MOE_TUNE_TIMEOUT)
     parsed = [
         {
             "device": m["device"],
@@ -477,17 +502,17 @@ def stage_p2(run: rb.Run, args) -> None:
     ]
     # 同一个 key 出现多次时，以最后一次为准
     entries = list({(e["device"], tuple(e["key"])): e for e in parsed}.values()) if rc == 0 else []
-    (run.out / "moe_tuned.json").write_text(json.dumps({"entries": entries}, indent=2))
+    (run.out / name).write_text(json.dumps({"entries": entries}, indent=2))
     run.log(f"  调参：返回码 {rc}，解析出 {len(parsed)} 条，保留 {len(entries)} 条")
-    missing = sorted(set(MOE_TOKENS) - {e["key"][2] for e in entries})
+    missing = sorted(set(tokens) - {e["key"][2] for e in entries})
     if rc == 0 and entries:
         if missing:
             run.log(f"  这些 token 数没有调出条目，用回退分块：{missing}")
-        run.record("P2", "WARN" if missing else "PASS", entries=entries, missing_tokens=missing)
+        run.record(stage, "WARN" if missing else "PASS", entries=entries, missing_tokens=missing)
     else:
         why = "超时" if rc == -9 else f"返回码 {rc}" if rc != 0 else "没有输出条目"
         run.record(
-            "P2", "FAIL", error=f"调参{why}，不写任何条目，Part 2 用回退分块", parsed=len(parsed)
+            stage, "FAIL", error=f"调参{why}，不写任何条目，服务用回退分块", parsed=len(parsed)
         )
 
 
@@ -506,10 +531,7 @@ def write_tuned_entries(repo: str, entries: list[dict]) -> None:
             for e in entries
             if e["device"] == device
         ]
-        lines[end:end] = [
-            "        # runbook_flashnext_v7x_stage2.py 调参并通过数值检查的条目\n",
-            *new,
-        ]
+        lines[end:end] = [f"        # {Path(sys.argv[0]).name} 调参并通过数值检查的条目\n", *new]
     path.write_text("".join(lines))
 
 
@@ -529,21 +551,34 @@ def tuned_entries_in_table(args, entries: list[dict]) -> bool:
 
 
 def stage_p3(run: rb.Run, args) -> None:
-    run.log(f"===== P3：{STAGE_INFO['P3']}")
+    check_tuned(run, args, "P3", "moe_tuned.json")
+
+
+def check_tuned(run: rb.Run, args, stage: str, name: str, quant: dict | None = None) -> None:
+    """name 里的条目逐条做数值检查，通过的临时写进工作区的调优表。
+
+    quant 是量化权重的 {"w_dtype", "quant_block_k"}，不给就是 bf16 权重。
+    """
+    run.log(f"===== {stage}：{rb.STAGE_INFO[stage]}")
     rb.git(args.repo, "checkout", "HEAD", "--", TUNED_CONFIGS_FILE)  # 从仓库里的版本开始写
-    tuned = run.out / "moe_tuned.json"
+    tuned = run.out / name
     entries = json.loads(tuned.read_text())["entries"] if tuned.exists() else []
     if not entries:
-        run.record("P3", rb.NOT_RUN, reason="P2 没有调出条目，Part 2 用回退分块")
+        run.record(stage, rb.NOT_RUN, reason="调参没有调出条目，服务用回退分块")
         return
     checks, passed = [], []
     for e in entries:
-        blocks = {name: v for name, v in zip(MOE_BLOCK_NAMES, e["value"]) if name}
+        blocks = {k: v for k, v in zip(MOE_BLOCK_NAMES, e["value"]) if k}
         n = e["key"][2]  # key 的第 3 项是 token 数
-        check = {"num_tokens": n, "blocks": blocks, "bts": e["value"][MOE_BTS_INDEX]}
+        check = {
+            "num_tokens": n,
+            "blocks": blocks,
+            "bts": e["value"][MOE_BTS_INDEX],
+            **(quant or {}),
+        }
         res = run_worker(
             run, args, "moe-check", check,
-            f"p3_moe_check_{n}", timeout=MOE_CHECK_TIMEOUT,
+            f"{stage.lower()}_moe_check_{n}", timeout=MOE_CHECK_TIMEOUT,
         )  # fmt: skip
         ok = res.get("passed", False)
         run.log(f"  token 数 {n}：{'通过' if ok else '没通过'}  {e['value']}")
@@ -551,20 +586,20 @@ def stage_p3(run: rb.Run, args) -> None:
         if ok:
             passed.append(e)
     if not passed:
-        run.record("P3", "FAIL", error="没有条目通过数值检查，Part 2 用回退分块", checks=checks)
+        run.record(stage, "FAIL", error="没有条目通过数值检查，服务用回退分块", checks=checks)
         return
     try:
         write_tuned_entries(args.repo, passed)
         if not tuned_entries_in_table(args, passed):
             raise RuntimeError("写完之后导入调优表，条目对不上")
-    except Exception as e:  # noqa: BLE001 - 写坏了就还原，Part 2 用回退分块
+    except Exception as e:  # noqa: BLE001 - 写坏了就还原，服务用回退分块
         rb.git(args.repo, "checkout", "HEAD", "--", TUNED_CONFIGS_FILE)
-        run.record("P3", "FAIL", error=f"写进调优表失败，已还原：{e}", checks=checks)
+        run.record(stage, "FAIL", error=f"写进调优表失败，已还原：{e}", checks=checks)
         return
     diff = rb.git(args.repo, "diff", "--", TUNED_CONFIGS_FILE).stdout
-    (run.out / "p3_tuned_configs.diff").write_text(diff)
+    (run.out / f"{stage.lower()}_tuned_configs.diff").write_text(diff)
     status = "PASS" if len(passed) == len(entries) else "WARN"
-    run.record("P3", status, checks=checks, written=passed)
+    run.record(stage, status, checks=checks, written=passed)
 
 
 # ---- Part 2 -------------------------------------------------------------------
@@ -598,9 +633,11 @@ def mmlu_status(run, res: dict) -> str:
     return "FAIL"
 
 
-def measure_perf(run, srv, args, profile: dict | None) -> tuple[dict, list[str]]:
+def measure_perf(
+    run, srv, args, profile: dict | None, sweep=fu.BENCH_SWEEP
+) -> tuple[dict, list[str]]:
     bench, errors = {}, []
-    for cfg in fu.BENCH_SWEEP:
+    for cfg in sweep:
         key = str(cfg["input_len"])
         try:
             bench[key] = rb.run_bench(run, srv, args, cfg, tag=f"_in{key}")
@@ -619,72 +656,89 @@ def measure_perf(run, srv, args, profile: dict | None) -> tuple[dict, list[str]]
     return {**result, "perf_errors": errors}, errors
 
 
+def check_launch(run, stage, srv, ready, checks, summary: str, written: list, required=()) -> None:
+    """PLE 打开的启动：加载摘要、n-gram 表、调优表里写进的分块、出 token。
+
+    required 是日志里还必须出现的行。
+    """
+    log = srv.log_path.read_text(errors="replace")
+    problems, warnings = [], []
+    if not checks["load_summary"] or summary not in checks["load_summary"]:
+        problems.append(f"加载摘要不等于 {summary}")
+    for line in (NGRAM_TABLE_LOADED, *required):
+        if line not in log:
+            problems.append(f"日志里没有 {line!r}")
+    skipped = [line for line in log.splitlines() if NGRAM_VERIFY_SKIPPED in line]
+    if skipped:
+        warnings.append(f"哈希校验有 {len(skipped)} 项被跳过：{skipped[0].strip()}")
+    if written and TUNED_CONFIG_USED not in log:
+        warnings.append(f"调优表里写进了 {len(written)} 条分块，但日志里没有 {TUNED_CONFIG_USED!r}")
+    smoke = srv.generate(rb.PROMPTS[0], 16)
+    if not smoke["text"].strip() or any(math.isnan(x) for x in smoke["logprobs"]):
+        problems.append("冒烟请求输出为空或 logprob 里有 NaN")
+    run.log(f"  冒烟请求：{rb.PROMPTS[0]!r} -> {smoke['text']!r}")
+    for p in problems + warnings:
+        run.log(f"  问题：{p}")
+    allocated = [line.strip() for line in log.splitlines() if NGRAM_ALLOCATED in line]
+    run.record(
+        stage,
+        "FAIL" if problems else "WARN" if warnings else "PASS",
+        problems=problems + warnings,
+        ready_minutes=round(ready / 60, 1),
+        smoke=smoke["text"],
+        tuned_config_used=TUNED_CONFIG_USED in log,
+        ngram_allocated=allocated[-1] if allocated else None,
+        **{**checks, "load_summary_ok": summary in (checks["load_summary"] or "")},
+    )
+
+
+def run_gpqa(run, srv, args, stage: str, gate: tuple[str, str], fresh: bool) -> None:
+    """GPQA-Diamond 每个 seed 跑一次，跑完一个落盘一个。
+
+    gate 是（启动阶段，MMLU 阶段）：启动没过或者 MMLU 接近随机时不跑。fresh 为假时保留
+    上次跑完、这次没重跑的 seed。
+    """
+    launch, mmlu = gate
+    launch_status = run.results.get(launch, {}).get("status")
+    mmlu_score = run.results.get(mmlu, {}).get("mmlu", {}).get("score")
+    if launch_status == "FAIL" or (mmlu_score is not None and mmlu_score < MMLU_FLOOR):
+        reason = (
+            f"{launch} 没有通过" if launch_status == "FAIL" else f"{mmlu} 的 MMLU 只有 {mmlu_score}"
+        )
+        run.record(stage, rb.NOT_RUN, reason=f"{reason}，模型已经不对，GPQA 没有意义")
+        return
+    runs = {} if fresh else dict(run.results.get(stage, {}).get("runs", {}))
+    try:
+        for seed in [int(s) for s in args.gpqa_seeds.split(",") if s.strip()]:
+            job = run_eval_job(run, srv, args, f"{stage.lower()}_gpqa_seed{seed}", GPQA_JOB, seed)
+            runs[str(seed)] = job
+            run.results[stage] = {"status": "未完成", "runs": runs}
+            run.save()
+    except Exception as e:  # noqa: BLE001 - 服务退出时，已经跑完的 seed 照样留下
+        run.record(stage, "FAIL", error=f"{type(e).__name__}: {e}", runs=runs)
+        return
+    scores = [r["score"] for r in runs.values() if "score" in r]
+    summary = {"runs": runs, "published": GPQA_PUBLISHED}
+    if scores:
+        med = statistics.median(scores)
+        summary.update(median=round(med, 4), delta=round(med - GPQA_PUBLISHED, 4))
+        run.log(f"  GPQA 中位数 {med:.4f}（{len(scores)} 个 seed），模型卡 {GPQA_PUBLISHED}")
+    clean = scores and len(scores) == len(runs) and not any(r.get("errors") for r in runs.values())
+    run.record(stage, "PASS" if clean else "WARN" if scores else "FAIL", **summary)
+
+
 def stage_ple_on(run: rb.Run, args, wanted: set[str]) -> None:
     def s1(srv, ready, checks):
-        log = srv.log_path.read_text(errors="replace")
-        problems, warnings = [], []
-        if not checks["load_summary"] or EXPECTED_LOAD_SUMMARY_PLE not in checks["load_summary"]:
-            problems.append(f"加载摘要不等于 {EXPECTED_LOAD_SUMMARY_PLE}")
-        if NGRAM_TABLE_LOADED not in log:
-            problems.append(f"日志里没有 {NGRAM_TABLE_LOADED!r}，n-gram 表没有装完")
-        skipped = [line for line in log.splitlines() if NGRAM_VERIFY_SKIPPED in line]
-        if skipped:
-            warnings.append(f"哈希校验有 {len(skipped)} 项被跳过：{skipped[0].strip()}")
         written = run.results.get("P3", {}).get("written", [])
-        if written and TUNED_CONFIG_USED not in log:
-            warnings.append(f"P3 写进了 {len(written)} 条分块，但日志里没有 {TUNED_CONFIG_USED!r}")
-        smoke = srv.generate(rb.PROMPTS[0], 16)
-        if not smoke["text"].strip() or any(math.isnan(x) for x in smoke["logprobs"]):
-            problems.append("冒烟请求输出为空或 logprob 里有 NaN")
-        run.log(f"  冒烟请求：{rb.PROMPTS[0]!r} -> {smoke['text']!r}")
-        for p in problems + warnings:
-            run.log(f"  问题：{p}")
-        status = "FAIL" if problems else "WARN" if warnings else "PASS"
-        run.record(
-            "S1",
-            status,
-            problems=problems + warnings,
-            ready_minutes=round(ready / 60, 1),
-            smoke=smoke["text"],
-            tuned_config_used=TUNED_CONFIG_USED in log,
-            **{
-                **checks,
-                "load_summary_ok": EXPECTED_LOAD_SUMMARY_PLE in (checks["load_summary"] or ""),
-            },
-        )
+        check_launch(run, "S1", srv, ready, checks, EXPECTED_LOAD_SUMMARY_PLE, written)
 
     def s2(srv, ready, checks):
         res = run_eval_job(run, srv, args, "s2_mmlu", MMLU_JOB, MMLU_JOB["seed"])
         run.record("S2", mmlu_status(run, res), mmlu=res)
 
     def s3(srv, ready, checks):
-        s1_status = run.results.get("S1", {}).get("status")
-        s2_score = run.results.get("S2", {}).get("mmlu", {}).get("score")
-        if s1_status == "FAIL" or (s2_score is not None and s2_score < MMLU_FLOOR):
-            reason = "S1 没有通过" if s1_status == "FAIL" else f"S2 的 MMLU 只有 {s2_score}"
-            run.record("S3", rb.NOT_RUN, reason=f"{reason}，模型已经不对，GPQA 没有意义")
-            return
         # 只重跑 GPQA 时（这次没有 S1）保留没重跑的 seed；整轮重跑时从头来
-        runs = {} if "S1" in wanted else dict(run.results.get("S3", {}).get("runs", {}))
-        try:
-            for seed in [int(s) for s in args.gpqa_seeds.split(",") if s.strip()]:
-                job = run_eval_job(run, srv, args, f"s3_gpqa_seed{seed}", GPQA_JOB, seed)
-                runs[str(seed)] = job
-                run.results["S3"] = {"status": "未完成", "runs": runs}
-                run.save()
-        except Exception as e:  # noqa: BLE001 - 服务退出时，已经跑完的 seed 照样留下
-            run.record("S3", "FAIL", error=f"{type(e).__name__}: {e}", runs=runs)
-            return
-        scores = [r["score"] for r in runs.values() if "score" in r]
-        summary = {"runs": runs, "published": GPQA_PUBLISHED}
-        if scores:
-            med = statistics.median(scores)
-            summary.update(median=round(med, 4), delta=round(med - GPQA_PUBLISHED, 4))
-            run.log(f"  GPQA 中位数 {med:.4f}（{len(scores)} 个 seed），模型卡 {GPQA_PUBLISHED}")
-        clean = (
-            scores and len(scores) == len(runs) and not any(r.get("errors") for r in runs.values())
-        )
-        run.record("S3", "PASS" if clean else "WARN" if scores else "FAIL", **summary)
+        run_gpqa(run, srv, args, "S3", ("S1", "S2"), fresh="S1" in wanted)
 
     def s4(srv, ready, checks):
         profile = fu.PROFILE_REQUEST if args.profile_prefill else PROFILE_DECODE
