@@ -7,7 +7,9 @@ it adds is the sparse route: compress the step's indexer keys and scatter them,
 pick the blocks, and attend over only those. A QSA layer takes that route in
 every forward mode, prefill included: the model is trained to attend over the
 selected blocks, and once a context outgrows the selection budget dense
-attention computes something else.
+attention computes something else. Until then the selection is every visible
+block, so a batch whose requests all fit the budget runs the inherited dense
+kernel instead and skips the selection.
 
 The indexer's weights stay in the model, as they do upstream and in DSA: the
 attention module calls ``QSAIndexer.project`` and hands down the projections
@@ -175,7 +177,8 @@ class QSASparseAttentionBackend(FlashAttention):
         attention_sink: jax.Array = None,
         **qsa_kwargs,
     ):
-        """Sparse for a layer with an indexer, dense for any other.
+        """Dense for a layer without an indexer, or for a batch whose requests
+        all fit the selection budget; sparse otherwise.
 
         ``qsa_kwargs`` carries the model's indexer outputs for this step,
         ``indexer_q`` (scoring queries) and ``indexer_k`` (raw keys, before
@@ -233,10 +236,35 @@ class QSASparseAttentionBackend(FlashAttention):
         )
         kv_fused = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
-        out = self._run_sparse(
-            q, qsa_kwargs["indexer_q"], compressed_cache, kv_fused, layer, forward_batch
+        out = jax.lax.cond(
+            self._every_block_selected(),
+            lambda: self._run_dense(q, k, v, layer, forward_batch, token_to_kv_pool),
+            lambda: self._run_sparse(
+                q, qsa_kwargs["indexer_q"], compressed_cache, kv_fused, layer, forward_batch
+            ).reshape(q.shape[0], -1),
         )
-        return out.reshape(q.shape[0], -1), QSAFusedCache(kv_fused, compressed_cache, ring)
+        return out, QSAFusedCache(kv_fused, compressed_cache, ring)
+
+    def _every_block_selected(self):
+        """Whether the selection would return every visible block.
+
+        A query at position ``p`` sees ``(p + 1) // compress_ratio`` closed
+        blocks. While no request reaches ``(block_topk + 1) * compress_ratio``
+        tokens, the top-k keeps all of them, and attending over the selection
+        plus the open group is causal attention over the whole prefix.
+        """
+        limit = (self.block_topk + 1) * self.compress_ratio
+        return jnp.max(self.forward_metadata.seq_lens) < limit
+
+    def _run_dense(self, q, k, v, layer, forward_batch, token_to_kv_pool):
+        """The inherited dense kernel, over a cache that already holds the
+        step's keys; it writes the same keys again, which changes nothing.
+        Returns the sparse path's dtype and layout, which ``lax.cond`` needs
+        both branches to share."""
+        out, _ = super().__call__(q, k, v, layer, forward_batch, token_to_kv_pool)
+        return jax.sharding.reshard(
+            out.astype(jnp.float32), P(self.attention_data_partition_axis, "tensor")
+        )
 
     def _absorb_indexer_step(self, token_to_kv_pool, slot, forward_batch, qsa_kwargs):
         """Compress this step's keys and write the completed groups.

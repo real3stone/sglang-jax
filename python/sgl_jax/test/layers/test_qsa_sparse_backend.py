@@ -473,71 +473,153 @@ class TestSparsePath(unittest.TestCase):
         its open group; the KV cache the gather reads must already hold the
         step's own keys.
         """
-        mesh = _mesh()
         block_topk = 2
         rank = _Rank([24, 29], [0, 1], np.random.default_rng(0), q_lens=[24, 9])
         self.assertGreater(int(np.max((rank.positions + 1) // RATIO)), block_topk)
-        n_tokens = len(rank.positions)
-        rng = np.random.default_rng(1)
-        k = rng.standard_normal((n_tokens, 1, _Rank.HEAD_DIM), np.float32)
-        v = rng.standard_normal((n_tokens, 1, _Rank.HEAD_DIM), np.float32)
-        slots = rank.slots_of_tokens()
+        out, fused, want_kv = _extend_step(self, rank, block_topk)
 
-        backend = _backend(
-            mesh,
-            num_heads=_Rank.HEADS,
-            head_dim=_Rank.HEAD_DIM,
-            page_size=_Rank.PAGE_SIZE,
-            block_topk=block_topk,
-        )
-        backend.forward_metadata = _metadata(mesh, [rank.metadata])
-        kv = {"buffer": _put(mesh, rank.kv, SPECS["kv"])}
-
-        def set_kv_buffer(layer_id, loc, k, v, is_decode):
-            self.assertFalse(is_decode)
-            buffer = np.array(kv["buffer"])
-            loc = np.asarray(loc)
-            page, offset = loc // _Rank.PAGE_SIZE, loc % _Rank.PAGE_SIZE
-            buffer[page, offset, 0, 0] = np.asarray(k)[:, 0]
-            buffer[page, offset, 1, 0] = np.asarray(v)[:, 0]
-            kv["buffer"] = _put(mesh, buffer, SPECS["kv"])
-
-        compressed = _put(mesh, rank.compressed, SPECS["compressed"])
-        rings = _put(mesh, np.zeros((4, RATIO, _Rank.IDX_DIM), np.float32), SPECS["ring"])
-        pool = SimpleNamespace(
-            get_compressed_key_buffer=lambda slot: compressed,
-            get_open_group_buffer=lambda slot: rings,
-            set_kv_buffer=set_kv_buffer,
-            get_fused_kv_buffer=lambda layer_id: kv["buffer"],
-        )
-        forward_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_decode=lambda: False),
-            positions=_put(mesh, rank.positions, SPECS["per_token"]),
-            req_pool_indices=_put(mesh, rank.slots, SPECS["per_token"]),
-            out_cache_loc=_put(mesh, slots, SPECS["per_token"]),
-        )
-        layer = SimpleNamespace(layer_id=0, head_dim=_Rank.HEAD_DIM, scaling=None)
-        select_patch, attend_patch = _cpu_kernels()
-        with select_patch, attend_patch, jax.set_mesh(mesh):
-            out, fused = backend(
-                _put(mesh, rank.q, SPECS["q"]),
-                _put(mesh, k, SPECS["kv_new"]),
-                _put(mesh, v, SPECS["kv_new"]),
-                layer,
-                forward_batch,
-                pool,
-                indexer_q=_put(mesh, rank.indexer_q, SPECS["indexer_q"]),
-                indexer_k=_put(mesh, rank.indexer_k, SPECS["indexer_k"]),
-                indexer=_indexer(mesh),
-                indexer_rotary_emb=_rotary(),
-            )
-
-        want_kv = rank.kv.copy()
-        want_kv[slots // _Rank.PAGE_SIZE, slots % _Rank.PAGE_SIZE, 0, 0] = k[:, 0]
-        want_kv[slots // _Rank.PAGE_SIZE, slots % _Rank.PAGE_SIZE, 1, 0] = v[:, 0]
         np.testing.assert_array_equal(np.asarray(fused.kv), want_kv)
         want_ids = rank.expected_selection(np.asarray(fused.compressed), block_topk)
-        want = rank.expected_attention(want_ids, want_kv).reshape(n_tokens, -1)
+        want = rank.expected_attention(want_ids, want_kv).reshape(len(rank.positions), -1)
+        self.assertLess(_relative_error(out, want), 1e-5)
+
+
+def _extend_step(test, rank, block_topk, dense=None):
+    """One extend step through the whole backend call.
+
+    The pool writes the step's keys into the rank's cache. ``dense``, when
+    given, stands in for the inherited dense kernel. Returns the output, the
+    write-back the backend hands the pool, and the cache that write-back must
+    hold.
+    """
+    mesh = _mesh()
+    n_tokens = len(rank.positions)
+    rng = np.random.default_rng(1)
+    k = rng.standard_normal((n_tokens, 1, _Rank.HEAD_DIM), np.float32)
+    v = rng.standard_normal((n_tokens, 1, _Rank.HEAD_DIM), np.float32)
+    slots = rank.slots_of_tokens()
+
+    backend = _backend(
+        mesh,
+        num_heads=_Rank.HEADS,
+        head_dim=_Rank.HEAD_DIM,
+        page_size=_Rank.PAGE_SIZE,
+        block_topk=block_topk,
+    )
+    backend.forward_metadata = _metadata(mesh, [rank.metadata])
+    kv = {"buffer": _put(mesh, rank.kv, SPECS["kv"])}
+
+    def set_kv_buffer(layer_id, loc, k, v, is_decode):
+        test.assertFalse(is_decode)
+        buffer = np.array(kv["buffer"])
+        loc = np.asarray(loc)
+        page, offset = loc // _Rank.PAGE_SIZE, loc % _Rank.PAGE_SIZE
+        buffer[page, offset, 0, 0] = np.asarray(k)[:, 0]
+        buffer[page, offset, 1, 0] = np.asarray(v)[:, 0]
+        kv["buffer"] = _put(mesh, buffer, SPECS["kv"])
+
+    compressed = _put(mesh, rank.compressed, SPECS["compressed"])
+    rings = _put(mesh, np.zeros((4, RATIO, _Rank.IDX_DIM), np.float32), SPECS["ring"])
+    pool = SimpleNamespace(
+        get_compressed_key_buffer=lambda slot: compressed,
+        get_open_group_buffer=lambda slot: rings,
+        set_kv_buffer=set_kv_buffer,
+        get_fused_kv_buffer=lambda layer_id: kv["buffer"],
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode=lambda: False),
+        positions=_put(mesh, rank.positions, SPECS["per_token"]),
+        req_pool_indices=_put(mesh, rank.slots, SPECS["per_token"]),
+        out_cache_loc=_put(mesh, slots, SPECS["per_token"]),
+    )
+    layer = SimpleNamespace(layer_id=0, head_dim=_Rank.HEAD_DIM, scaling=None)
+    select_patch, attend_patch = _cpu_kernels()
+    dense_patch = mock.patch.object(FlashAttention, "__call__", dense or _unreachable_dense)
+    with select_patch, attend_patch, dense_patch, jax.set_mesh(mesh):
+        out, fused = backend(
+            _put(mesh, rank.q, SPECS["q"]),
+            _put(mesh, k, SPECS["kv_new"]),
+            _put(mesh, v, SPECS["kv_new"]),
+            layer,
+            forward_batch,
+            pool,
+            indexer_q=_put(mesh, rank.indexer_q, SPECS["indexer_q"]),
+            indexer_k=_put(mesh, rank.indexer_k, SPECS["indexer_k"]),
+            indexer=_indexer(mesh),
+            indexer_rotary_emb=_rotary(),
+        )
+
+    want_kv = rank.kv.copy()
+    want_kv[slots // _Rank.PAGE_SIZE, slots % _Rank.PAGE_SIZE, 0, 0] = k[:, 0]
+    want_kv[slots // _Rank.PAGE_SIZE, slots % _Rank.PAGE_SIZE, 1, 0] = v[:, 0]
+    return out, fused, want_kv
+
+
+def _unreachable_dense(backend, q, k, v, layer, forward_batch, pool, *args):
+    """A dense kernel whose output no sparse batch may return: NaN."""
+    return jnp.full((q.shape[0], q.shape[1] * q.shape[2]), jnp.nan, jnp.bfloat16), None
+
+
+def _marker_dense(backend, q, k, v, layer, forward_batch, pool, *args):
+    return jnp.full((q.shape[0], q.shape[1] * q.shape[2]), 7.0, jnp.bfloat16), None
+
+
+def _causal_dense(rank):
+    """Causal attention over each request's whole prefix, read from the cache
+    the dense kernel is handed, independent of blocks and selection."""
+    keys_per_req = _Rank.PAGES_PER_SEQ * _Rank.PAGE_SIZE
+
+    def call(backend, q, k, v, layer, forward_batch, pool, *args):
+        q = jax.sharding.reshard(q, P())
+        kv = jax.sharding.reshard(pool.get_fused_kv_buffer(layer.layer_id), P())[:, :, :, 0]
+        per_req = kv[rank.table].reshape(len(rank.table), keys_per_req, 2, _Rank.HEAD_DIM)
+        keys = per_req[rank.token_to_req, :, 0]
+        values = per_req[rank.token_to_req, :, 1]
+        scores = jnp.einsum("thd,tld->thl", q, keys, precision=jax.lax.Precision.HIGHEST) * (
+            _Rank.HEAD_DIM**-0.5
+        )
+        visible = np.arange(keys_per_req)[None, :] <= rank.positions[:, None]
+        scores = jnp.where(visible[:, None, :], scores, -jnp.inf)
+        out = jnp.einsum(
+            "thl,tld->thd",
+            jax.nn.softmax(scores, axis=-1),
+            values,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        return out.reshape(q.shape[0], -1), None
+
+    return call
+
+
+class TestDensePath(unittest.TestCase):
+    def test_the_budget_decides_which_kernel_runs(self):
+        """With 6 blocks selectable the limit is 28 tokens: a request of 27 sees
+        at most 6 closed blocks, so the selection is all of them and the batch
+        runs the dense kernel; one request of 28 sees 7, and the whole batch
+        stays sparse."""
+        for lengths, dense in (((24, 27), True), ((24, 28), False)):
+            with self.subTest(lengths=lengths):
+                rank = _Rank(list(lengths), [0, 1], np.random.default_rng(0), q_lens=[24, 9])
+                out, _, _ = _extend_step(self, rank, block_topk=6, dense=_marker_dense)
+                out = np.asarray(out)
+                if dense:
+                    np.testing.assert_array_equal(out, 7.0)
+                else:
+                    self.assertTrue(np.isfinite(out).all())
+                    self.assertFalse((out == 7.0).any())
+
+    def test_within_the_budget_dense_attention_is_the_selections_answer(self):
+        """Lengths 24 and 29 see at most 7 closed blocks, all of them selected
+        with 7 selectable. The dense kernel, handed the cache with the step's
+        keys, must give what attending over the selection plus the open group
+        gives."""
+        block_topk = 7
+        rank = _Rank([24, 29], [0, 1], np.random.default_rng(0), q_lens=[24, 9])
+        out, fused, want_kv = _extend_step(self, rank, block_topk, dense=_causal_dense(rank))
+
+        self.assertEqual(out.dtype, jnp.float32)
+        want_ids = rank.expected_selection(np.asarray(fused.compressed), block_topk)
+        want = rank.expected_attention(want_ids, want_kv).reshape(len(rank.positions), -1)
         self.assertLess(_relative_error(out, want), 1e-5)
 
 
