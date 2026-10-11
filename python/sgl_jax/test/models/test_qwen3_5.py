@@ -566,5 +566,77 @@ class TestQwen3_5Dense(unittest.TestCase):
                 )
 
 
+class TestGDNProjectionsUnderTP(unittest.TestCase):
+    """The loader lays in_proj_qkvz / in_proj_ba out rank-major and the layer
+    splits them locally: on a tensor axis of 2, every component equals its HF
+    projection, comes out head-striped, and no collective moves it."""
+
+    def test_rank_major_split(self):
+        if len(jax.devices()) < 2:
+            self.skipTest("needs 2 devices (JAX_NUM_CPU_DEVICES=2)")
+        from jax.sharding import PartitionSpec as P
+
+        for tp in (1, 2):
+            with self.subTest(tp=tp):
+                got, want, hlo = self._project(tp)
+                for name, g, w in zip("qkvzba", got, want):
+                    np.testing.assert_allclose(np.asarray(g), w, rtol=1e-5, atol=1e-4, err_msg=name)
+                    self.assertEqual(g.sharding.spec, P("data", "tensor"), name)
+                for op in ("collective-permute", "all-gather", "all-to-all", "all-reduce"):
+                    self.assertIsNone(re.search(rf"\b{op}(-start)?\(", hlo), op)
+
+    @staticmethod
+    def _project(tp):
+        """Load HF-layout projections through the model's recipe, then run the
+        layer's split; returns (q, k, v, z, b, a), the HF references, and the
+        compiled HLO."""
+        from flax import nnx
+        from jax.sharding import AxisType, Mesh, NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.models.qwen3_5 import (
+            Qwen3_5GatedDeltaNet,
+            Qwen3_5MoeForConditionalGeneration,
+        )
+
+        cfg = _make_config(num_layers=4, is_moe=True)
+        H = cfg.text_config.hidden_size
+        rng = np.random.default_rng(tp)
+        mesh = Mesh(
+            np.array(jax.devices()[:tp]).reshape(1, tp),
+            ("data", "tensor"),
+            axis_types=(AxisType.Explicit, AxisType.Explicit),
+        )
+        with jax.set_mesh(mesh):
+            gdn = Qwen3_5GatedDeltaNet(cfg, mesh, layer_id=0, dtype=jnp.float32)
+            kd, vd, nv = gdn.key_dim, gdn.value_dim, gdn.num_v_heads
+            qkv, z, b, a = (
+                rng.standard_normal((rows, H)).astype(np.float32)
+                for rows in (2 * kd + vd, vd, nv, nv)
+            )
+            conv = rng.standard_normal((2 * kd + vd, 1, 4)).astype(np.float32)
+            model = SimpleNamespace(
+                language_model=SimpleNamespace(
+                    model=SimpleNamespace(layers=[SimpleNamespace(self_attn=gdn)])
+                ),
+                _put=lambda arr, spec: jax.device_put(arr, NamedSharding(mesh, P(*spec))),
+                _stripe_conv=Qwen3_5MoeForConditionalGeneration._stripe_conv,
+            )
+            qkvz_w, ba_w, _ = Qwen3_5MoeForConditionalGeneration._gdn_weights(
+                model, (qkv, z, b, a, conv), 0, tp
+            )
+            gdn.in_proj_qkvz.weight.value = qkvz_w
+            gdn.in_proj_ba.weight.value = ba_w
+
+            h_np = rng.standard_normal((8, H)).astype(np.float32)
+            h = jax.device_put(h_np, NamedSharding(mesh, P("data", None)))
+            graphdef, state = nnx.split(gdn)
+            project = jax.jit(lambda state, x: nnx.merge(graphdef, state)._project(x))
+            got = project(state, h)
+            hlo = project.lower(state, h).compile().as_text()
+        want = [h_np @ w.T for w in (qkv[:kd], qkv[kd : 2 * kd], qkv[2 * kd :], z, b, a)]
+        return got, want, hlo
+
+
 if __name__ == "__main__":
     unittest.main()

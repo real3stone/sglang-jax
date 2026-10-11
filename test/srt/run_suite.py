@@ -452,7 +452,12 @@ suites = {
             runner="pytest",
         ),
         TestFile("python/sgl_jax/test/multimodal/test_encoder_scheduler_kwargs.py", 0.1),
-        TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/models/test_qwen3_5.py",
+            2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile(
             "python/sgl_jax/test/models/test_minimax_m3_msa.py",
             3,

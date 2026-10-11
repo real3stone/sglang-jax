@@ -17,10 +17,10 @@ Key conventions confirmed against the upstream torch reference
 * MoE mirrors qwen2_moe: ``GateLogit`` + ``TopK`` + ``FusedEPMoE`` routed path,
   plus a dense ``Qwen2MoeMLP`` shared expert gated by ``sigmoid(shared_gate)``.
 * GDN fuses HF's 4 in-proj keys into 2 JAX projections
-  (``in_proj_qkvz`` = [Q|K|V|Z], ``in_proj_ba`` = [B|A]); the model reshards
-  the sliced q/k/v/z/a/b to ``P("data","tensor")`` so each TP rank sees its
-  head-striped shard (the GDN backend's ``shard_map`` contract). The conv1d
-  weight is stripe-rearranged at load time (see the weight loader in P3).
+  (``in_proj_qkvz`` = [Q|K|V|Z], ``in_proj_ba`` = [B|A]). Under TP the loader
+  lays their columns, like the conv1d weight's rows, out rank-major
+  ([q_r|k_r|v_r|z_r] for each rank r), so every rank slices its own head shard
+  of q/k/v/z/b/a without moving data (the GDN backend's ``shard_map`` contract).
 """
 
 from __future__ import annotations
@@ -211,6 +211,25 @@ class Qwen3_5Attention(nnx.Module):
         return out, kv_fused
 
 
+def _rank_major(x, sizes, tp):
+    """Rows of ``x`` from component-major [c0|c1|...] (``sizes`` rows each) to
+    rank-major [c0_r|c1_r|...] for r in range(tp): split evenly over tp ranks,
+    every rank then holds its own slice of each component."""
+    if tp <= 1:
+        return x
+    if any(size % tp for size in sizes):
+        raise ValueError(f"components {sizes} do not split evenly over {tp} ranks")
+    parts = np.split(x, np.cumsum(sizes)[:-1], axis=0)
+    return np.concatenate(
+        [
+            part[r * (len(part) // tp) : (r + 1) * (len(part) // tp)]
+            for r in range(tp)
+            for part in parts
+        ],
+        axis=0,
+    )
+
+
 # =============================================================================
 # Gated DeltaNet (30 layers) — fused in_proj_qkvz / in_proj_ba + GDN backend
 # =============================================================================
@@ -238,6 +257,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         ba_out = 2 * self.num_v_heads  # 64 = [B|A]
         conv_dim = 2 * self.key_dim + self.value_dim  # 8192 = [Q|K|V]
 
+        # Both projections' columns are rank-major under TP>1 (see _split).
         self.in_proj_qkvz = LinearBase(
             input_size=self.hidden_size,
             output_size=qkvz_out,
@@ -309,10 +329,31 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             dt_bias=self.dt_bias,
         )
 
-    def _shard_dt(self, x):
-        # Reshard a sliced [T, C] tensor so its channel axis is head-striped
-        # across "tensor" (each TP rank gets its head shard). No-op at TP=1.
-        return jax.sharding.reshard(x, P("data", "tensor"))
+    def _project(self, hidden_states):
+        """q, k, v, z, b, a, each [T, C] with its channel axis head-striped over
+        "tensor"."""
+        qkvz, _ = self.in_proj_qkvz(hidden_states)  # [T, 2*key_dim + 2*value_dim]
+        ba, _ = self.in_proj_ba(hidden_states)  # [T, 2*num_v_heads]
+        kd, vd, nv = self.key_dim, self.value_dim, self.num_v_heads
+        return (*self._split(qkvz, (kd, kd, vd, vd)), *self._split(ba, (nv, nv)))
+
+    def _split(self, x, sizes):
+        """Components of a [T, sum(sizes)] projection whose columns are
+        rank-major: each rank holds [c0_r|c1_r|...], so it slices them locally."""
+        tp = self.mesh.shape["tensor"]
+        T = x.shape[0]
+        widths = [size // tp for size in sizes]
+        x = x.reshape(
+            T, tp, sum(widths), out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+        )
+        out, start = [], 0
+        for size, width in zip(sizes, widths):
+            part = x[:, :, start : start + width]
+            out.append(
+                part.reshape(T, size, out_sharding=NamedSharding(self.mesh, P("data", "tensor")))
+            )
+            start += width
+        return out
 
     def _norm_gate(self, core_out, z):
         """Per-head RMSNorm over head_v_dim, then the output gate on z: silu(z),
@@ -337,17 +378,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
 
     def __call__(self, positions, hidden_states, forward_batch, recurrent_state_pool):
         del positions  # GDN is position-agnostic.
-        qkvz, _ = self.in_proj_qkvz(hidden_states)  # [T, 2*key_dim + 2*value_dim]
-        ba, _ = self.in_proj_ba(hidden_states)  # [T, 2*num_v_heads]
-
-        kd, vd = self.key_dim, self.value_dim
-        q = self._shard_dt(qkvz[:, :kd])
-        k = self._shard_dt(qkvz[:, kd : 2 * kd])
-        v = self._shard_dt(qkvz[:, 2 * kd : 2 * kd + vd])
-        z = self._shard_dt(qkvz[:, 2 * kd + vd :])
-        b = self._shard_dt(ba[:, : self.num_v_heads])
-        a = self._shard_dt(ba[:, self.num_v_heads :])
-
+        q, k, v, z, b, a = self._project(hidden_states)
         core_out, attn_state = self.self_attn(forward_batch, q, k, v, a, b, recurrent_state_pool)
         # core_out: [T, value_dim] -> per-head RMSNorm + silu(z) gate.
         core_out = self._norm_gate(core_out, z)
@@ -703,28 +734,20 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     def _gdn_weights(self, inputs, layer_idx, tp):
         qkv, z, b, a, conv = inputs
         gdn = self.language_model.model.layers[layer_idx].self_attn
+        kd, vd, nv = gdn.key_dim, gdn.value_dim, gdn.num_v_heads
+        qkvz = _rank_major(np.concatenate((qkv, z), axis=0), (kd, kd, vd, vd), tp)
+        ba = _rank_major(np.concatenate((b, a), axis=0), (nv, nv), tp)
         conv = self._stripe_conv(conv.reshape(conv.shape[0], conv.shape[-1]), gdn, tp)
         return (
-            self._put(np.concatenate((qkv, z), axis=0).T, (None, "tensor")),
-            self._put(np.concatenate((b, a), axis=0).T, (None, "tensor")),
+            self._put(qkvz.T, (None, "tensor")),
+            self._put(ba.T, (None, "tensor")),
             self._put(conv, ("tensor", None)),
         )
 
     @staticmethod
     def _stripe_conv(conv, gdn, tp):
         """[conv_dim, K] component-major [Q|K|V] -> rank-major [q_d|k_d|v_d]."""
-        if tp <= 1:
-            return conv
-        kd = gdn.key_dim
-        q_blk, k_blk, v_blk = conv[:kd], conv[kd : 2 * kd], conv[2 * kd :]
-        k_tp = (gdn.num_k_heads // tp) * gdn.head_k_dim
-        v_tp = (gdn.num_v_heads // tp) * gdn.head_v_dim
-        blocks = []
-        for r in range(tp):
-            blocks.append(q_blk[r * k_tp : (r + 1) * k_tp])
-            blocks.append(k_blk[r * k_tp : (r + 1) * k_tp])
-            blocks.append(v_blk[r * v_tp : (r + 1) * v_tp])
-        return np.concatenate(blocks, axis=0)
+        return _rank_major(conv, (gdn.key_dim, gdn.key_dim, gdn.value_dim), tp)
 
     @staticmethod
     def _moe_gate_up(inputs):
