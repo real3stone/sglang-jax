@@ -46,8 +46,10 @@ checkpoint；A1 另外带上 cookbook 的两个 parser。
   C1  FP8 MoE 调参：bench_fused_moe --tune-block-config，FP8 权重、量化分块 128，覆盖 16–2048
       八个 token 档位，结果存成 moe_tuned_fp8.json。
   C2  调好的分块逐条做数值检查（FP8 权重、量化分块 128、512 专家、top-10、2560 / 640、ep=8、
-      atol / rtol 5e-2），通过的条目临时写进工作区的 tuned_block_configs.py，git diff 存成
-      c2_tuned_configs.diff。没有条目通过时，C3 起用默认分块。
+      atol / rtol 5e-2）。没过的再用仓库 FP8 测试的容差 2e-1 复查一次：只在 2e-1 下通过的照样
+      写进去，C2 判 WARN，报告里单独列出；2e-1 也没过的丢掉。通过的条目临时写进工作区的
+      tuned_block_configs.py，git diff 存成 c2_tuned_configs.diff。没有条目通过时，C3 起用默认
+      分块。
   C3  启动：加载摘要逐字等于 "consumed=148523, skipped=3566, missing=0, unexpected=0"，日志里有
       "N-gram table: 128/128 shards" 和 47.7 GiB 的表；C2 写进了条目时，日志里要有
       "Using tuned block config"；再发一个请求。
@@ -56,7 +58,7 @@ checkpoint；A1 另外带上 cookbook 的两个 parser。
       65536。只记录：每个 seed 的分数、中位数，和 bf16 的 0.904、模型卡 0.917 的差。每个
       seed 跑完就落盘。C3 没过或者 C4 低于 0.30 时不跑。
   C6  同 A4 的三组压测。vLLM 那组的输出吞吐和 vLLM 的 1430 tok/s 对比，这是追平的主指标。
-  C7  decode profile 同 A5；停掉服务后，用 bench_one_batch --profile 抓 prefill：8 × 1024 token
+  C7  decode profile 同 A5；停掉服务后，用 bench_one_batch --profile 抓 prefill：2 × 1024 token
       和 1 × 2048 token 各一次，每次都重新加载模型。
 
   评测都放在子进程里跑，同时盯着服务进程：服务一退出，评测就停下来，当前阶段记 FAIL。
@@ -68,7 +70,7 @@ checkpoint；A1 另外带上 cookbook 的两个 parser。
   E0 的 FAIL 是本机环境问题：按列出的问题修好后重跑，这种情况不打包、不用发回。
   其余阶段不管什么结果都不用自己排查，把两个压缩包原样发回。
 
-时长：三次启动各 20–30 分钟；Part A、B 各约 1 小时；C1 / C2 约 1–2 小时；GPQA 5 个 seed
+时长：三次启动各 20–30 分钟；Part A、B 各约 1 小时；C1 / C2 约 2–3 小时；GPQA 5 个 seed
 估计 4–8 小时。合计一个晚上到一个半晚上，放在 tmux / screen 里或者用 nohup 跑。
 
 用法：在 sglang-jax 仓库根目录下运行。
@@ -166,8 +168,13 @@ MOE_TUNE_FP8_ARGS = [
     "--max-configs", "20",
 ]  # fmt: skip
 MOE_TUNED_FP8 = "moe_tuned_fp8.json"
+# 5e-2 下没过时的复查容差，和仓库 FP8 sub-channel 测试相同。参照实现用的是同一份量化权重和
+# scale，差别只来自累加顺序；分块配置真坏了误差是 O(1)，这个容差照样能发现
+MOE_RECHECK_TOL = 2e-1
 
-PREFILL_PROFILES = ((8, 1024), (1, 2048))  # (batch, 每个请求的 token 数)
+# (batch, 每个请求的 token 数)。服务端一个 prefill 批次最多 2048 个 token：vLLM 那组负载是两个
+# 1024 token 的请求，长 prompt 是一个 2048 的 chunk
+PREFILL_PROFILES = ((2, 1024), (1, 2048))
 PREFILL_TIMEOUT = 3600  # 每次都要重新加载模型
 PREFILL_DIR = "profile_c7_prefill"
 
@@ -541,7 +548,9 @@ def part_c(run: rb.Run, args, wanted: set[str]) -> None:
         "C1": lambda: s2.tune_moe(
             run, args, "C1", MOE_TUNE_FP8_ARGS, MOE_TOKENS_FP8, MOE_TUNED_FP8
         ),
-        "C2": lambda: s2.check_tuned(run, args, "C2", MOE_TUNED_FP8, MOE_QUANT_FP8),
+        "C2": lambda: s2.check_tuned(
+            run, args, "C2", MOE_TUNED_FP8, MOE_QUANT_FP8, MOE_RECHECK_TOL
+        ),
     }
     for stage, fn in tuning.items():
         if stage in wanted:
@@ -754,13 +763,24 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
             "",
             "### C1 / C2 调好的 FP8 分块",
             "",
-            "| token 数 | 分块 | 数值检查 |",
-            "| --- | --- | --- |",
+            f"5e-2 没过的条目用 {MOE_RECHECK_TOL:g} 复查；误差是 5e-2 下 assert_allclose 报的超差元素里的最大值。",
+            "",
+            "| token 数 | 分块 | 数值检查 | 最大绝对误差 | 最大相对误差 |",
+            "| --- | --- | --- | --- | --- |",
         ]
+        verdict = {
+            s2.MOE_CHECK_TOL: "5e-2 下通过",
+            MOE_RECHECK_TOL: "只在 2e-1 下通过",
+            None: "没通过",
+        }
         lines += [
-            f"| {c['num_tokens']} | {tuple(c['value'])} | {'通过' if c['passed'] else '没通过'} |"
+            f"| {c['num_tokens']} | {tuple(c['value'])} | {verdict[c.get('tol')]} | "
+            f"{c.get('max_abs_diff', '-')} | {c.get('max_rel_diff', '-')} |"
             for c in c2
         ]
+        loose = [c["num_tokens"] for c in c2 if c.get("tol") == MOE_RECHECK_TOL]
+        if loose:
+            lines += ["", f"只在 2e-1 下通过、照样写进调优表的条目（token 数）：{loose}"]
         diff = run.out / "c2_tuned_configs.diff"
         if diff.exists():
             lines += ["", "写进工作区的改动：", "", "```diff", diff.read_text().rstrip(), "```"]

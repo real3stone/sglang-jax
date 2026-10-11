@@ -137,6 +137,7 @@ MOE_TUNED_LINE = re.compile(
 MOE_BLOCK_NAMES = ("bt", "bf", "bd1", "bd2", None, "btc", "bfc", "bd1c", "bd2c", "bse")
 MOE_BTS_INDEX = 4
 MOE_CHECK_TIMEOUT = 1800
+MOE_CHECK_TOL = 5e-2  # atol 和 rtol
 TUNED_CONFIGS_FILE = "python/sgl_jax/srt/kernels/fused_moe/v1/tuned_block_configs.py"
 
 # ---- Part 2 -------------------------------------------------------------------
@@ -300,11 +301,18 @@ def worker_moe_check(spec: dict) -> dict:
             seed=54321,
             renormalize_topk_logits=True,
             act_fn="silu",
-            atol=5e-2,
-            rtol=5e-2,
+            atol=spec["tol"],
+            rtol=spec["tol"],
             **quant,
             **spec["blocks"],
         )
+    except AssertionError as e:
+        diff = {}
+        for key, kind in (("max_abs_diff", "absolute"), ("max_rel_diff", "relative")):
+            m = re.search(rf"Max {kind} difference[^:]*:\s*([-+0-9.eE]+)", str(e))
+            if m:
+                diff[key] = float(m[1])
+        return {"passed": False, **diff}
     finally:
         case.tearDown()
     return {"passed": True}
@@ -554,10 +562,18 @@ def stage_p3(run: rb.Run, args) -> None:
     check_tuned(run, args, "P3", "moe_tuned.json")
 
 
-def check_tuned(run: rb.Run, args, stage: str, name: str, quant: dict | None = None) -> None:
+def check_tuned(
+    run: rb.Run,
+    args,
+    stage: str,
+    name: str,
+    quant: dict | None = None,
+    recheck_tol: float | None = None,
+) -> None:
     """name 里的条目逐条做数值检查，通过的临时写进工作区的调优表。
 
-    quant 是量化权重的 {"w_dtype", "quant_block_k"}，不给就是 bf16 权重。
+    quant 是量化权重的 {"w_dtype", "quant_block_k"}，不给就是 bf16 权重。recheck_tol 给出时，
+    MOE_CHECK_TOL 下没过的条目再用它复查一次：通过的照样写进去，阶段判 WARN。
     """
     run.log(f"===== {stage}：{rb.STAGE_INFO[stage]}")
     rb.git(args.repo, "checkout", "HEAD", "--", TUNED_CONFIGS_FILE)  # 从仓库里的版本开始写
@@ -577,12 +593,19 @@ def check_tuned(run: rb.Run, args, stage: str, name: str, quant: dict | None = N
             **(quant or {}),
         }
         res = run_worker(
-            run, args, "moe-check", check,
+            run, args, "moe-check", {**check, "tol": MOE_CHECK_TOL},
             f"{stage.lower()}_moe_check_{n}", timeout=MOE_CHECK_TIMEOUT,
         )  # fmt: skip
-        ok = res.get("passed", False)
-        run.log(f"  token 数 {n}：{'通过' if ok else '没通过'}  {e['value']}")
-        checks.append({"num_tokens": n, "value": e["value"], "passed": ok, **res})
+        tol = MOE_CHECK_TOL if res.get("passed") else None
+        if tol is None and recheck_tol is not None:
+            res["recheck"] = run_worker(
+                run, args, "moe-check", {**check, "tol": recheck_tol},
+                f"{stage.lower()}_moe_check_{n}_recheck", timeout=MOE_CHECK_TIMEOUT,
+            )  # fmt: skip
+            tol = recheck_tol if res["recheck"].get("passed") else None
+        ok = tol is not None
+        run.log(f"  token 数 {n}：{f'容差 {tol:g} 下通过' if ok else '没通过'}  {e['value']}")
+        checks.append({**res, "num_tokens": n, "value": e["value"], "passed": ok, "tol": tol})
         if ok:
             passed.append(e)
     if not passed:
@@ -598,7 +621,7 @@ def check_tuned(run: rb.Run, args, stage: str, name: str, quant: dict | None = N
         return
     diff = rb.git(args.repo, "diff", "--", TUNED_CONFIGS_FILE).stdout
     (run.out / f"{stage.lower()}_tuned_configs.diff").write_text(diff)
-    status = "PASS" if len(passed) == len(entries) else "WARN"
+    status = "PASS" if all(c["tol"] == MOE_CHECK_TOL for c in checks) else "WARN"
     run.record(stage, status, checks=checks, written=passed)
 
 
