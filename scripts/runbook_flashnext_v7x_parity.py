@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next 在 TPU v7x 上的性能追平测试（R1）：同一套启动参数下，测三种组合的精度和
+"""Qwen3.8-Flash-Next 在 TPU v7x 上的性能追平测试（R1）：同一套启动参数下，测四种组合的精度和
 吞吐，并给官方 FP8 checkpoint 调 MoE 分块。
 
   A  基底 A（当前的模型代码）+ bf16 checkpoint：基线。启动命令和 cookbook §2.3 完全一致，
@@ -6,6 +6,8 @@
   B  基底 B（预算以内的 QSA 层直接走稠密注意力，并能加载 FP8 checkpoint）+ bf16 checkpoint：
      和 A 的差就是稠密分支的收益。
   C  基底 B + 官方 FP8 checkpoint：先调 FP8 MoE 的分块，再测精度和吞吐。
+  D  基底 D（N-gram 表放进 HBM、在设备上查表，overlap 调度打开）+ FP8 checkpoint，和 C 用同一套
+     MoE 分块：和 C 的差就是这一步的收益。最后用 bf16 checkpoint 再启动一次，确认表放得下。
 
 和 runbook_flashnext_v7x.py 用同一套环境（前置条件见那份脚本的说明），另外要求：
   * FP8 checkpoint：Hugging Face 上的 Qwen/Qwen3.8-Flash-Next-FP8（约 173 GiB，131 个
@@ -14,11 +16,11 @@
   * 工作区干净：每一部分开始前，脚本把仓库 git checkout 到这一部分的基底（写死的提交，
     都在 bring-up 分支的历史里），全部跑完再切回原来的分支。
 
-三次启动的参数相同（上下文 69632、64 个请求，和 cookbook §2.3 一致），只换代码和
-checkpoint；A1 另外带上 cookbook 的两个 parser。
+各次启动的参数相同（上下文 69632、64 个请求，和 cookbook §2.3 一致），只换代码和
+checkpoint；A1 另外带上 cookbook 的两个 parser，Part D 不带 --disable-overlap-schedule。
 
 各阶段
-  E0  环境检查：runbook 的 C0 那几项（bf16 checkpoint；代码包含基底 B，也就包含了基底 A），
+  E0  环境检查：runbook 的 C0 那几项（bf16 checkpoint；代码包含基底 D，也就包含了 A 和 B），
       再加上：FP8 checkpoint 有 131 个 safetensors 文件，主机可用内存不少于 128 GiB，工作区
       没有未提交的改动。不满足就停。
 
@@ -61,6 +63,19 @@ checkpoint；A1 另外带上 cookbook 的两个 parser。
   C7  decode profile 同 A5；停掉服务后，用 bench_one_batch --profile 抓 prefill：2 × 1024 token
       和 1 × 2048 token 各一次，每次都重新加载模型。
 
+  Part D（基底 D，FP8，开 overlap）。切过去之后把 C2 通过的条目重新写进调优表。
+  D1  启动：加载摘要同 C3；日志里有 "N-gram table: 128/128 shards" 和 "N-gram table placed in
+      HBM: 320,001,536 rows x 160 split over 8 devices, 6.0 GiB each"，没有 "Overlap scheduler is
+      disabled"；C2 写进了条目时要有 "Using tuned block config"；再发一个请求。KV 池的容量
+      （token 数）和 C3 的并排记下来，差值就是表占掉的显存。
+  D2  MMLU 冒烟，判定同 A3，并和 C4 逐题对比：这是开 overlap、在设备上查表这条路径的正确性检查，
+      两边的差应在采样噪声以内。
+  D3  同 C6 的三组压测。和 C6 的差就是这一步的收益。
+  D4  同 A5。
+  D5  bf16 checkpoint 启动，只做启动检查：加载摘要同 A1，日志里有 "... split over 8 devices,
+      11.9 GiB each"，冒烟请求正常，记下 KV 池容量。
+  Part D 的阶段失败时，报告里附上服务日志的最后几十行。
+
   评测都放在子进程里跑，同时盯着服务进程：服务一退出，评测就停下来，当前阶段记 FAIL。
   单个请求最多等 6 小时，超时就记下来、不重发；有请求出错时阶段判 WARN，出错数写进报告。
 
@@ -70,8 +85,9 @@ checkpoint；A1 另外带上 cookbook 的两个 parser。
   E0 的 FAIL 是本机环境问题：按列出的问题修好后重跑，这种情况不打包、不用发回。
   其余阶段不管什么结果都不用自己排查，把两个压缩包原样发回。
 
-时长：三次启动各 20–30 分钟；Part A、B 各约 1 小时；C1 / C2 约 2–3 小时；GPQA 5 个 seed
-估计 4–8 小时。合计一个晚上到一个半晚上，放在 tmux / screen 里或者用 nohup 跑。
+时长：每次启动 20–30 分钟；Part A、B 各约 1 小时；C1 / C2 约 2–3 小时；GPQA 5 个 seed
+估计 4–8 小时；D1–D4 约 1.5–2 小时，D5 约 0.5 小时。合计一个半到两个晚上，放在 tmux / screen
+里或者用 nohup 跑。
 
 用法：在 sglang-jax 仓库根目录下运行。
   python scripts/runbook_flashnext_v7x_parity.py --model-path /data/Qwen3.8-Flash-Next \\
@@ -106,8 +122,9 @@ PARTS = {
     "A": ("A1", "A2", "A3", "A4", "A5"),
     "B": ("B1", "B2", "B3", "B4"),
     "C": ("C1", "C2", "C3", "C4", "C5", "C6", "C7"),
+    "D": ("D1", "D2", "D3", "D4", "D5"),
 }
-STAGES = ("E0", *PARTS["A"], *PARTS["B"], *PARTS["C"])
+STAGES = ("E0", *PARTS["A"], *PARTS["B"], *PARTS["C"], *PARTS["D"])
 STAGE_INFO = {
     "E0": "环境检查：TPU 设备、两份 checkpoint、仓库和代码版本、主机内存、工作区干净",
     "A1": "基底 A + bf16 启动（cookbook 命令）：加载摘要、n-gram 表、出 token",
@@ -126,16 +143,27 @@ STAGE_INFO = {
     "C5": "GPQA-Diamond × 5 个 seed（FP8，max_tokens 65536）",
     "C6": "压测三组（FP8）",
     "C7": "decode profile（vLLM 负载）+ prefill profile（bench_one_batch）（FP8）",
+    "D1": "基底 D + FP8 启动，开 overlap：表在 HBM、overlap 没被关、KV 池容量",
+    "D2": "MMLU 冒烟（基底 D，FP8），和 C4 逐题对比",
+    "D3": "压测三组（基底 D，FP8）",
+    "D4": "decode profile，vLLM 负载（基底 D，FP8）",
+    "D5": "基底 D + bf16 启动，开 overlap：只看表放不放得下",
 }
 rb.STAGE_INFO.update(STAGE_INFO)  # stage_launch 和 stage2 的函数打印阶段标题时查这张表
 
-# 每部分的代码基底。B 是 rb.REQUIRED_COMMIT，A 是它的祖先
+# 每部分的代码基底。D 是 rb.REQUIRED_COMMIT，A、B 是它的祖先
 BASES = {
     "A": "429ed463",  # sgl-project/sglang-jax#1781 的 head
     "B": "8fe3d481",  # A 之上：预算以内走稠密注意力，加载 FP8 checkpoint
+    "D": "b7f05c28",  # B 之上：N-gram 表放进 HBM、在设备上查表，overlap 调度不再关掉
 }
-PART_BASE = {"A": "A", "B": "B", "C": "B"}
-PART_LABEL = {"A": "A：基底 A + bf16", "B": "B：基底 B + bf16", "C": "C：基底 B + FP8"}
+PART_BASE = {"A": "A", "B": "B", "C": "B", "D": "D"}
+PART_LABEL = {
+    "A": "A：基底 A + bf16",
+    "B": "B：基底 B + bf16",
+    "C": "C：基底 B + FP8",
+    "D": "D：基底 D + FP8，开 overlap",
+}
 
 MIN_MEM_AVAILABLE_GIB = 128  # bf16 的 n-gram 表 95.4 GiB，FP8 的 47.7 GiB，两次启动不同时在内存里
 
@@ -145,6 +173,12 @@ COOKBOOK_PARSERS = ("--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_
 LAUNCH_COOKBOOK = {**LAUNCH, "extra_args": COOKBOOK_PARSERS}
 EXPECTED_LOAD_SUMMARY_FP8 = "consumed=148523, skipped=3566, missing=0, unexpected=0"
 NGRAM_ALLOCATED_FP8 = "N-gram table allocated: 320,001,536 rows x 160 = 47.7 GiB"
+LAUNCH_OVERLAP = {**LAUNCH, "overlap": True}
+NGRAM_IN_HBM = "N-gram table placed in HBM: 320,001,536 rows x 160 split over 8 devices, "
+NGRAM_IN_HBM_FP8 = NGRAM_IN_HBM + "6.0 GiB each"
+NGRAM_IN_HBM_BF16 = NGRAM_IN_HBM + "11.9 GiB each"
+OVERLAP_DISABLED = "Overlap scheduler is disabled"
+LOG_TAIL_LINES = 40
 
 # vLLM recipe 的负载：4 × H100、FP8 时输出吞吐约 1430 tok/s
 VLLM_BENCH = {"input_len": 1024, "output_len": 256, "num_prompts": 256, "concurrency": 64}
@@ -471,10 +505,12 @@ def profile_step(run: rb.Run, args, stage: str):
     return fn
 
 
-def launch_step(run: rb.Run, stage: str, summary: str, written_from=None, required=()):
+def launch_step(
+    run: rb.Run, stage: str, summary: str, written_from=None, required=(), forbidden=()
+):
     def fn(srv, ready, checks):
         written = run.results.get(written_from, {}).get("written", []) if written_from else []
-        s2.check_launch(run, stage, srv, ready, checks, summary, written, required)
+        s2.check_launch(run, stage, srv, ready, checks, summary, written, required, forbidden)
 
     return fn
 
@@ -542,8 +578,38 @@ def part_b(run: rb.Run, args, wanted: set[str]) -> None:
     rb.stage_launch(run, args, "qsa_sparse", steps, LAUNCH, "b_bf16")
 
 
+def fp8_args(args):
+    return argparse.Namespace(**{**vars(args), "model_path": args.fp8_model_path})
+
+
+def rewrite_tuned(run: rb.Run, args) -> None:
+    """把 C2 通过检查的条目再写进调优表：切换代码会把调优表还原。"""
+    written = run.results.get("C2", {}).get("written", [])
+    if not written:
+        run.log("C2 没有通过检查的条目，服务用默认分块")
+        return
+    try:
+        s2.write_tuned_entries(args.repo, written)
+        run.log(f"按 C2 的结果，把 {len(written)} 条分块重新写进工作区的调优表")
+    except Exception as e:  # noqa: BLE001 - 写不进去就用默认分块
+        rb.git(args.repo, "checkout", "HEAD", "--", s2.TUNED_CONFIGS_FILE)
+        run.log(f"C2 的分块写不进调优表，服务用默认分块：{type(e).__name__}: {e}")
+
+
+def attach_log_tail(run: rb.Run, stages, label: str) -> None:
+    """失败的阶段附上服务日志的最后 LOG_TAIL_LINES 行。"""
+    path = run.out / f"server_{label}.log"
+    if not path.exists():
+        return
+    tail = path.read_text(errors="replace").splitlines()[-LOG_TAIL_LINES:]
+    for s in stages:
+        if run.results.get(s, {}).get("status") == "FAIL":
+            run.results[s]["log_tail"] = tail
+    run.save()
+
+
 def part_c(run: rb.Run, args, wanted: set[str]) -> None:
-    args = argparse.Namespace(**{**vars(args), "model_path": args.fp8_model_path})
+    args = fp8_args(args)
     tuning = {
         "C1": lambda: s2.tune_moe(
             run, args, "C1", MOE_TUNE_FP8_ARGS, MOE_TOKENS_FP8, MOE_TUNED_FP8
@@ -559,14 +625,8 @@ def part_c(run: rb.Run, args, wanted: set[str]) -> None:
             except Exception as e:  # noqa: BLE001 - 调参失败不阻断后面，服务用默认分块
                 run.log(f"{stage} 出错：{type(e).__name__}: {e}")
                 run.record(stage, "FAIL", error=f"{type(e).__name__}: {e}")
-    written = run.results.get("C2", {}).get("written", [])
-    if "C2" not in wanted and written:  # 断点重跑：把上次通过检查的条目再写进去
-        try:
-            s2.write_tuned_entries(args.repo, written)
-            run.log(f"按上次 C2 的结果，把 {len(written)} 条分块重新写进工作区的调优表")
-        except Exception as e:  # noqa: BLE001 - 写不进去就用默认分块
-            rb.git(args.repo, "checkout", "HEAD", "--", s2.TUNED_CONFIGS_FILE)
-            run.log(f"上次 C2 的分块写不进调优表，服务用默认分块：{type(e).__name__}: {e}")
+    if "C2" not in wanted:  # 断点重跑：用上次 C2 的结果
+        rewrite_tuned(run, args)
 
     decode = {}
 
@@ -602,7 +662,28 @@ def part_c(run: rb.Run, args, wanted: set[str]) -> None:
     run.record("C7", status, decode=decode, prefill=prefill, prefill_profile=summary)
 
 
-PART_FNS = {"A": part_a, "B": part_b, "C": part_c}
+def part_d(run: rb.Run, args, wanted: set[str]) -> None:
+    fp8 = fp8_args(args)
+    rewrite_tuned(run, args)  # 和 C 用同一套分块，C → D 的差别只剩这一步
+    steps = [
+        ("D1", launch_step(
+            run, "D1", EXPECTED_LOAD_SUMMARY_FP8, "C2", (NGRAM_IN_HBM_FP8,), (OVERLAP_DISABLED,)
+        )),
+        ("D2", mmlu_step(run, fp8, "D2", ref="C4")),
+        ("D3", bench_step(run, fp8, "D3")),
+        ("D4", profile_step(run, fp8, "D4")),
+    ]  # fmt: skip
+    steps = [(s, fn) for s, fn in steps if s in wanted]
+    if steps:
+        rb.stage_launch(run, fp8, "qsa_sparse", steps, LAUNCH_OVERLAP, "d_fp8")
+        attach_log_tail(run, [s for s, _ in steps], "d_fp8")
+    if "D5" in wanted:
+        d5 = launch_step(run, "D5", s2.EXPECTED_LOAD_SUMMARY_PLE, required=(NGRAM_IN_HBM_BF16,))
+        rb.stage_launch(run, args, "qsa_sparse", [("D5", d5)], LAUNCH_OVERLAP, "d_bf16")
+        attach_log_tail(run, ["D5"], "d_bf16")
+
+
+PART_FNS = {"A": part_a, "B": part_b, "C": part_c, "D": part_d}
 
 
 def run_part(run: rb.Run, args, part: str, wanted: set[str]) -> None:
@@ -635,21 +716,22 @@ def bench_of(r: dict, stage: str, cfg: dict) -> dict | None:
 
 def write_report(run: rb.Run, args, repo: dict) -> Path:
     r = run.results
-    perf_stage = {"A": "A4", "B": "B3", "C": "C6"}
-    mmlu_stage = {"A": "A3", "B": "B2", "C": "C4"}
+    perf_stage = {"A": "A4", "B": "B3", "C": "C6", "D": "D3"}
+    mmlu_stage = {"A": "A3", "B": "B2", "C": "C4", "D": "D2"}
     checkouts_path = run.out / "checkouts.json"
     checkouts = json.loads(checkouts_path.read_text()) if checkouts_path.exists() else []
     lines = ["# Qwen3.8-Flash-Next 性能追平测试（R1）", "", "## 1. 设计", ""]
     lines += ["| 组合 | 代码 | checkpoint |", "| --- | --- | --- |"]
     for part, label in PART_LABEL.items():
         heads = sorted({c["head"][:12] for c in checkouts if c["part"] == part})
-        ckpt = "官方 FP8" if part == "C" else "bf16"
+        ckpt = {"C": "官方 FP8", "D": "官方 FP8（D5 用 bf16，只做启动检查）"}.get(part, "bf16")
         lines += [
             f"| {label} | {BASES[PART_BASE[part]]}，HEAD {', '.join(heads) or '-'} | {ckpt} |"
         ]
     lines += [
         "",
-        f"启动参数（三部分相同，C 换成 FP8 checkpoint，A1 另加 {' '.join(COOKBOOK_PARSERS)}）：",
+        "启动参数（各部分相同，C、D 换成 FP8 checkpoint，D 去掉 --disable-overlap-schedule，"
+        f"A1 另加 {' '.join(COOKBOOK_PARSERS)}）：",
         "",
         "```bash",
         shlex.join(rb.server_cmd(args, "qsa_sparse", LAUNCH)),
@@ -716,21 +798,44 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
             f"{c5['median'] - GPQA_BF16_MEDIAN:+.4f}，和模型卡 {s2.GPQA_PUBLISHED} 差 {c5['delta']:+.4f}。"
             "seed 只用来区分 5 次运行：服务端不使用请求里的 seed，重跑同一个 seed 不会复现。",
         ]
-    vs = [(s, r.get(s, {}).get("vs")) for s in ("B2", "C4")]
+    vs = [(s, r.get(s, {}).get("vs")) for s in ("B2", "C4", "D2")]
     vs = [(s, v) for s, v in vs if v]
     if vs:
         lines += [
             "",
-            "MMLU 逐题对比（参照 A3）：",
+            "MMLU 逐题对比：",
             "",
-            "| 阶段 | 题数 | 都对 | 只有 A3 对 | 只有这次对 | 都错 | 抽到的答案相同 |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| 阶段 | 参照 | 题数 | 都对 | 只有参照对 | 只有这次对 | 都错 | 抽到的答案相同 |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         lines += [
-            f"| {s} | {v['questions']} | {v['both_right']} | {v['only_ref_right']} | "
-            f"{v['only_this_right']} | {v['both_wrong']} | {v['same_answer']} |"
+            f"| {s} | {v['against'].split('_')[0].upper()} | {v['questions']} | {v['both_right']} | "
+            f"{v['only_ref_right']} | {v['only_this_right']} | {v['both_wrong']} | {v['same_answer']} |"
             for s, v in vs
         ]
+
+    launches = [(s, r[s]) for s in ("A1", "B1", "C3", "D1", "D5") if "load_summary" in r.get(s, {})]
+    if launches:
+        lines += [
+            "",
+            "### 2.3 启动",
+            "",
+            "| 阶段 | 结果 | 加载摘要 | n-gram 表 | KV 池 token 数 |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for s, c in launches:
+            table = c.get("ngram_in_hbm") or c.get("ngram_allocated") or "-"
+            summary = "符合" if c.get("load_summary_ok") else f"`{c.get('load_summary')}`"
+            lines += [
+                f"| {s} | {c['status']} | {summary} | {table.split('] ')[-1]} | "
+                f"{c.get('kv_tokens', '-')} |"
+            ]
+        c3, d1 = r.get("C3", {}).get("kv_tokens"), r.get("D1", {}).get("kv_tokens")
+        if c3 and d1:
+            lines += [
+                "",
+                f"KV 池 D1 比 C3 少 {c3 - d1} 个 token，这就是 n-gram 表在 HBM 里占掉的部分。",
+            ]
 
     lines += ["", "## 3. 结论（脚本按目标自动判定）", ""]
     lines += conclusions(r)
@@ -749,12 +854,10 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
         lines += [f"- {s} 问题：{p}" for p in c.get("problems", [])]
         lines += [f"- {s}：{c[k]}" for k in ("error", "reason") if k in c]
         lines += [f"- {s} 性能测量出错：{e}" for e in c.get("perf_errors", [])]
-    for s in ("A1", "B1", "C3"):
-        c = r.get(s, {})
-        if "load_summary" in c:
-            lines += [
-                f"- {s} 加载摘要：`{c['load_summary']}`；n-gram 表：`{c.get('ngram_allocated')}`"
-            ]
+    for s in PARTS["D"]:
+        tail = r.get(s, {}).get("log_tail")
+        if tail:
+            lines += ["", f"{s} 失败时服务日志的最后 {len(tail)} 行：", "", "```text", *tail, "```"]
     if (run.out / "a2_cookbook.md").exists():
         lines += ["", "cookbook 三个请求的输出见 a2_cookbook.md。"]
     c2 = r.get("C2", {}).get("checks", [])
@@ -786,7 +889,7 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
             lines += ["", "写进工作区的改动：", "", "```diff", diff.read_text().rstrip(), "```"]
     if r.get("C1", {}).get("missing_tokens"):
         lines += ["", f"C1 没调出条目的 token 数：{r['C1']['missing_tokens']}"]
-    for s in ("A5", "B4"):
+    for s in ("A5", "B4", "D4"):
         if r.get(s, {}).get("profile"):
             lines += [f"- {s} profile：{r[s]['profile']}"]
     c7 = r.get("C7", {})
@@ -804,20 +907,22 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
 
 def conclusions(r: dict) -> list[str]:
     lines = []
-    c6 = bench_of(r, "C6", VLLM_BENCH) or {}
-    if "output_throughput" in c6:
-        x = c6["output_throughput"]
+    for stage, part in (("C6", "C"), ("D3", "D")):
+        m = bench_of(r, stage, VLLM_BENCH) or {}
+        if "output_throughput" not in m:
+            lines += [f"- 吞吐（{PART_LABEL[part]}）：{stage} 没有 vLLM 负载的数字。"]
+            continue
+        x = m["output_throughput"]
         verdict = "达到" if x >= VLLM_OUTPUT_THROUGHPUT else "没达到"
         lines += [
-            f"- 吞吐：FP8 在 vLLM 负载下输出 {x:.1f} tok/s，是 vLLM {VLLM_OUTPUT_THROUGHPUT} tok/s 的 "
-            f"{x / VLLM_OUTPUT_THROUGHPUT:.0%}，{verdict}追平目标。"
+            f"- 吞吐（{PART_LABEL[part]}）：vLLM 负载下输出 {x:.1f} tok/s，是 vLLM "
+            f"{VLLM_OUTPUT_THROUGHPUT} tok/s 的 {x / VLLM_OUTPUT_THROUGHPUT:.0%}，{verdict}追平目标。"
         ]
-    else:
-        lines += ["- 吞吐：C6 没有 vLLM 负载的数字。"]
-    c4 = r.get("C4", {}).get("mmlu", {})
-    if "score" in c4:
-        verdict = "达到" if c4["score"] > s2.MMLU_PASS else "没达到"
-        lines += [f"- FP8 MMLU {c4['score']:.2f}，{verdict}门槛 {s2.MMLU_PASS}。"]
+    for stage in ("C4", "D2"):
+        m = r.get(stage, {}).get("mmlu", {})
+        if "score" in m:
+            verdict = "达到" if m["score"] > s2.MMLU_PASS else "没达到"
+            lines += [f"- {stage} MMLU {m['score']:.2f}，{verdict}门槛 {s2.MMLU_PASS}。"]
     c5 = r.get("C5", {})
     if "median" in c5:
         d = c5["median"] - GPQA_BF16_MEDIAN
@@ -826,40 +931,48 @@ def conclusions(r: dict) -> list[str]:
             f"- FP8 GPQA 中位数 {c5['median']}，和 bf16 的 {GPQA_BF16_MEDIAN} 差 {d:+.4f}，"
             f"{verdict} ±{GPQA_TOLERANCE} 以内。"
         ]
-    a3, b2 = r.get("A3", {}).get("mmlu", {}), r.get("B2", {}).get("mmlu", {})
-    if "score" in a3 and "score" in b2:
-        lines += [
-            f"- 稠密分支：B2 − A3 = {b2['score'] - a3['score']:+.2f}"
-            "（100 题、准确率 0.9 左右时，两次运行之差的标准差约 0.04）。"
-        ]
+    noise = "（100 题、准确率 0.9 左右时，两次运行之差的标准差约 0.04）"
+    for this, ref, what in (("B2", "A3", "稠密分支"), ("D2", "C4", "表在 HBM + overlap")):
+        a, b = r.get(ref, {}).get("mmlu", {}), r.get(this, {}).get("mmlu", {})
+        if "score" in a and "score" in b:
+            lines += [f"- {what}：{this} − {ref} = {b['score'] - a['score']:+.2f}{noise}。"]
     return lines
 
 
 def contributions(r: dict) -> list[str]:
     tput = {
         p: (bench_of(r, s, VLLM_BENCH) or {}).get("output_throughput")
-        for p, s in (("A", "A4"), ("B", "B3"), ("C", "C6"))
+        for p, s in (("A", "A4"), ("B", "B3"), ("C", "C6"), ("D", "D3"))
     }
-    if any(v is None for v in tput.values()):
+    if any(tput[p] is None for p in "ABC"):
         return ["A4 / B3 / C6 有一组缺 vLLM 负载的数字，算不出占比。"]
-    a, b, c = tput["A"], tput["B"], tput["C"]
-    lines = [f"A {a:.1f} → B {b:.1f} → C {c:.1f} tok/s；vLLM {VLLM_OUTPUT_THROUGHPUT}。"]
-    if c > a:
+    steps = [
+        ("预算以内走稠密注意力（A → B）", "A", "B"),
+        ("FP8 checkpoint + FP8 MoE 分块（B → C）", "B", "C"),
+    ]
+    if tput["D"] is not None:
+        steps += [("N-gram 表进 HBM + overlap（C → D）", "C", "D")]
+    last = steps[-1][2]
+    a, end = tput["A"], tput[last]
+    lines = [
+        " → ".join(f"{p} {tput[p]:.1f}" for p in "ABCD" if tput[p] is not None)
+        + f" tok/s；vLLM {VLLM_OUTPUT_THROUGHPUT}。"
+    ]
+    if end > a:
+        lines += ["", f"| 优化 | 提升 tok/s | 占 A → {last} 的比例 |", "| --- | --- | --- |"]
         lines += [
-            "",
-            "| 优化 | 提升 tok/s | 占 A → C 的比例 |",
-            "| --- | --- | --- |",
-            f"| 预算以内走稠密注意力（A → B） | {b - a:+.1f} | {(b - a) / (c - a):.0%} |",
-            f"| FP8 checkpoint + FP8 MoE 分块（B → C） | {c - b:+.1f} | {(c - b) / (c - a):.0%} |",
+            f"| {name} | {tput[y] - tput[x]:+.1f} | {(tput[y] - tput[x]) / (end - a):.0%} |"
+            for name, x, y in steps
         ]
-    gap = VLLM_OUTPUT_THROUGHPUT - c
+    gap = VLLM_OUTPUT_THROUGHPUT - end
     if gap > 0:
         lines += [
             "",
-            f"离 vLLM 还差 {gap:.1f} tok/s，vLLM 是 C 的 {VLLM_OUTPUT_THROUGHPUT / c:.2f} 倍。",
+            f"{last} 离 vLLM 还差 {gap:.1f} tok/s，vLLM 是 {last} 的 "
+            f"{VLLM_OUTPUT_THROUGHPUT / end:.2f} 倍。",
         ]
     else:
-        lines += ["", f"比 vLLM 高 {-gap:.1f} tok/s。"]
+        lines += ["", f"{last} 比 vLLM 高 {-gap:.1f} tok/s。"]
     return lines
 
 
@@ -891,7 +1004,7 @@ def main() -> int:
     args.fp8_model_path = str(Path(args.fp8_model_path).resolve())
     args.repo = str(Path(args.repo).resolve())
     args.start_timeout = max(args.start_timeout, s2.READY_TIMEOUT_MIN)
-    fp8 = argparse.Namespace(**{**vars(args), "model_path": args.fp8_model_path})
+    fp8 = fp8_args(args)
 
     if args.dry_run:
         print("# 代码基底")
@@ -902,6 +1015,8 @@ def main() -> int:
             ("A1（基底 A，bf16，cookbook §2.3）", args, LAUNCH_COOKBOOK),
             ("B1（基底 B，bf16）", args, LAUNCH),
             ("C3（基底 B，FP8）", fp8, LAUNCH),
+            ("D1（基底 D，FP8，开 overlap）", fp8, LAUNCH_OVERLAP),
+            ("D5（基底 D，bf16，开 overlap）", args, LAUNCH_OVERLAP),
         )
         for name, a, launch in launches:
             print(f"\n# {name}\n{shlex.join(rb.server_cmd(a, 'qsa_sparse', launch))}")

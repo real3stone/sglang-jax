@@ -154,6 +154,8 @@ LAUNCH_PLE_OFF = dict(rb.DEFAULT_LAUNCH)  # 和第一轮跑通测试相同
 EXPECTED_LOAD_SUMMARY_PLE = "consumed=1163, skipped=495, missing=0, unexpected=0"
 NGRAM_TABLE_LOADED = "N-gram table: 128/128 shards"
 NGRAM_ALLOCATED = "N-gram table allocated:"
+NGRAM_IN_HBM = "N-gram table placed in HBM:"
+KV_TOKENS = re.compile(r"final max_total_num_tokens: (\d+)")
 NGRAM_VERIFY_SKIPPED = "keeping the derived values"
 TUNED_CONFIG_USED = "Using tuned block config"
 READY_TIMEOUT_MIN = 1800  # PLE 打开的那次启动还要读 95 GiB 的 n-gram 表，就绪等待至少给这么久
@@ -679,10 +681,12 @@ def measure_perf(
     return {**result, "perf_errors": errors}, errors
 
 
-def check_launch(run, stage, srv, ready, checks, summary: str, written: list, required=()) -> None:
+def check_launch(
+    run, stage, srv, ready, checks, summary: str, written: list, required=(), forbidden=()
+) -> None:
     """PLE 打开的启动：加载摘要、n-gram 表、调优表里写进的分块、出 token。
 
-    required 是日志里还必须出现的行。
+    required 是日志里还必须出现的行，forbidden 是不能出现的行。
     """
     log = srv.log_path.read_text(errors="replace")
     problems, warnings = [], []
@@ -691,6 +695,9 @@ def check_launch(run, stage, srv, ready, checks, summary: str, written: list, re
     for line in (NGRAM_TABLE_LOADED, *required):
         if line not in log:
             problems.append(f"日志里没有 {line!r}")
+    for line in forbidden:
+        if line in log:
+            problems.append(f"日志里不该有 {line!r}")
     skipped = [line for line in log.splitlines() if NGRAM_VERIFY_SKIPPED in line]
     if skipped:
         warnings.append(f"哈希校验有 {len(skipped)} 项被跳过：{skipped[0].strip()}")
@@ -703,6 +710,8 @@ def check_launch(run, stage, srv, ready, checks, summary: str, written: list, re
     for p in problems + warnings:
         run.log(f"  问题：{p}")
     allocated = [line.strip() for line in log.splitlines() if NGRAM_ALLOCATED in line]
+    in_hbm = [line.strip() for line in log.splitlines() if NGRAM_IN_HBM in line]
+    kv_tokens = KV_TOKENS.findall(log)
     run.record(
         stage,
         "FAIL" if problems else "WARN" if warnings else "PASS",
@@ -711,6 +720,8 @@ def check_launch(run, stage, srv, ready, checks, summary: str, written: list, re
         smoke=smoke["text"],
         tuned_config_used=TUNED_CONFIG_USED in log,
         ngram_allocated=allocated[-1] if allocated else None,
+        ngram_in_hbm=in_hbm[-1] if in_hbm else None,
+        kv_tokens=int(kv_tokens[-1]) if kv_tokens else None,
         **{**checks, "load_summary_ok": summary in (checks["load_summary"] or "")},
     )
 

@@ -185,6 +185,7 @@ DEFAULT_LAUNCH = {
     "max_running_requests": MAX_RUNNING_REQUESTS,
     "precompile_bs_paddings": (16,),
     "precompile_token_paddings": (16, 512, 1024),
+    "overlap": False,
     "extra_args": (),
 }
 
@@ -211,7 +212,7 @@ def server_cmd(args, backend: str, launch: dict | None = None) -> list[str]:
         "--max-running-requests", running,
         "--max-recurrent-state-size", running,
         "--disable-radix-cache",
-        "--disable-overlap-schedule",
+        *([] if cfg["overlap"] else ["--disable-overlap-schedule"]),
         *cfg["extra_args"],
         "--skip-server-warmup",
         "--random-seed", "3",
