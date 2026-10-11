@@ -400,6 +400,7 @@ class Qwen3_5MoeBlock(nnx.Module):
             activation="silu",
             layer_id=layer_id,
             renormalize_topk_logits=renorm,
+            quantization_config=getattr(config, "quantization_config", None),
         )
         # Dense shared expert (always present for 35B-A3B) gated per-token.
         self.shared_experts = Qwen2MoeMLP(
@@ -769,6 +770,8 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         if is_moe:
             for i in range(num_layers):
                 source = f"model.language_model.layers.{i}.mlp.experts.gate_up_proj"
+                if source not in mappings:  # a per-expert checkpoint has nothing to split
+                    continue
                 mappings[source].sources = (source,)
                 mappings[source].host_recipe = self._moe_gate_up
         loader = WeightLoader(self, model_config, self.mesh, dtype=self.dtype)

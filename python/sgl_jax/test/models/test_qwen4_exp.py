@@ -29,6 +29,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackendMetadata,
@@ -590,6 +591,16 @@ class TestReleasedConfig(CustomTestCase):
         self.assertEqual(model_config.moe_backend, MoEBackend.FUSED)
 
 
+def _fp8_checkpoint():
+    """What ModelConfig builds from the FP8 checkpoint's quantization_config."""
+    return QuantizationConfig(
+        linear_rules=[{"module_path": ".*", "weight_dtype": "float8_e4m3fn"}],
+        moe_weight_dtype=jnp.float8_e4m3fn,
+        is_static_checkpoint=True,
+        weight_block_size=(128, 128),
+    )
+
+
 def _mapping_head(config):
     from sgl_jax.srt.layers.embeddings import ParallelLMHead
 
@@ -663,6 +674,59 @@ class TestWeightMappings(CustomTestCase):
         Qwen4ExpForConditionalGeneration._log_load_summary(
             mappings, weight_info, visual_skip, mtp_skip
         )
+
+    def test_the_fp8_checkpoint_loads_every_expert_with_its_scale(self):
+        """The FP8 checkpoint ships each routed expert on its own, every weight
+        with a ``weight_scale_inv``. A weight loaded without its scale is off
+        by its block factors, and the load summary rejects any key it cannot
+        place."""
+        cfg = _config()
+        cfg.quantization_config = _fp8_checkpoint()
+        num_experts = cfg.text_config.num_experts
+        mappings, visual_skip, mtp_skip = _create_qwen4_exp_weight_mappings(cfg, _mapping_head(cfg))
+
+        for layer in range(NUM_LAYERS):
+            src = f"model.language_model.layers.{layer}.mlp.experts"
+            dst = f"language_model.model.layers.{layer}.mlp.experts"
+            self.assertNotIn(f"{src}.gate_up_proj", mappings)
+            self.assertNotIn(f"{src}.down_proj", mappings)
+            for target, name in (("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")):
+                weight, scale = mappings[f"{dst}.{target}"], mappings[f"{dst}.{target}_scale"]
+                self.assertEqual(
+                    weight.sources,
+                    tuple(f"{src}.{e}.{name}.weight" for e in range(num_experts)),
+                )
+                self.assertEqual(
+                    scale.sources,
+                    tuple(f"{src}.{e}.{name}.weight_scale_inv" for e in range(num_experts)),
+                )
+                self.assertEqual((weight.target_path, weight.transpose), (f"{dst}.{target}", True))
+                self.assertEqual(
+                    (scale.target_path, scale.transpose), (f"{dst}.{target}_scale", True)
+                )
+
+        weight_info = dict.fromkeys(
+            (s for key, spec in mappings.items() for s in (spec.sources or (key,))), []
+        )
+        Qwen4ExpForConditionalGeneration._log_load_summary(
+            mappings, weight_info, visual_skip, mtp_skip
+        )
+
+    def test_only_the_experts_are_quantized(self):
+        """Every linear layer ships in bf16 with no scale, so a linear rule
+        would swap it for a quantized layer the checkpoint cannot fill."""
+        quant = _fp8_checkpoint()
+        Qwen4ExpForConditionalGeneration.patch_model_config(
+            types.SimpleNamespace(quantization_config=quant)
+        )
+        self.assertEqual(quant.get_linear_rules(), [])
+        self.assertTrue(quant.has_moe_quantization())
+
+        dynamic = QuantizationConfig(linear_rules=[{"module_path": ".*"}])
+        Qwen4ExpForConditionalGeneration.patch_model_config(
+            types.SimpleNamespace(quantization_config=dynamic)
+        )
+        self.assertEqual(dynamic.get_linear_rules(), [{"module_path": ".*"}])
 
     def test_the_absorbed_norms_are_gone_and_no_added_entry_shares_a_target(self):
         """Leaving Qwen3.5's norms in would point at modules that no longer

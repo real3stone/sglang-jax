@@ -18,6 +18,8 @@ What differs:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -35,6 +37,7 @@ from sgl_jax.srt.layers.embeddings import (
 from sgl_jax.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.moe import create_moe_weights_mapping
 from sgl_jax.srt.layers.ngram_embedding import NGramEmbedding
 from sgl_jax.srt.layers.ngram_table import NGramTable, set_ngram_table
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -495,6 +498,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
     causal_lm_class = Qwen4ExpForCausalLM
     vision_model_class = None
 
+    @classmethod
+    def patch_model_config(cls, mc) -> None:
+        """The FP8 checkpoint quantizes only the routed experts and the N-gram
+        table, which ``NGramTable`` reads itself; every linear layer ships in
+        bf16, so no linear rule applies."""
+        quant = mc.quantization_config
+        if quant is not None and quant.is_static_checkpoint:
+            quant.linear_rules = []
+
     def _weight_mappings(self, hf_config):
         return _create_qwen4_exp_weight_mappings(hf_config, getattr(self, "lm_head", None))
 
@@ -593,6 +605,11 @@ def _create_qwen4_exp_weight_mappings(hf_config, lm_head: ParallelLMHead | None 
             )
         )
 
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is not None and getattr(quant, "is_static_checkpoint", False):
+        for i in range(num_layers):
+            _replace_with_fp8_experts(mappings, i, int(tc.num_experts))
+
     # The loader treats both skip lists alike. With the N-gram layer on, only
     # its table and hash buffers are skipped: they stay on the host and
     # _install_ngram_table reads them. With it off, nothing reads any of it.
@@ -601,6 +618,35 @@ def _create_qwen4_exp_weight_mappings(hf_config, lm_head: ParallelLMHead | None 
     else:
         mtp_skip = [*mtp_skip, r"^model\.language_model\.layers\.\d+\.ple\."]
     return mappings, visual_skip, mtp_skip
+
+
+def _replace_with_fp8_experts(mappings: dict, layer: int, num_experts: int) -> None:
+    """The FP8 checkpoint's routed experts: one tensor per expert, each with a
+    ``weight_scale_inv`` of 128x128 blocks, in place of the bf16 checkpoint's
+    pre-fused ``gate_up_proj`` and ``down_proj``. The loader stacks the scales
+    and converts them to the fused kernel's layout."""
+    src = f"model.language_model.layers.{layer}"
+    dst = f"language_model.model.layers.{layer}.mlp.experts"
+    del mappings[f"{src}.mlp.experts.gate_up_proj"]
+    del mappings[f"{src}.mlp.experts.down_proj"]
+    experts = create_moe_weights_mapping(
+        prefix=src,
+        target_prefix=dst,
+        num_experts=num_experts,
+        moe_backend="fused",
+        moe_path="mlp",
+        source_expert_pattern="experts.{i}",
+    )
+    for spec in experts.values():
+        weight = replace(spec, target_path=f"{dst}.{spec.target_path.rsplit('.', 1)[1]}")
+        scale = WeightSpec(
+            target_path=f"{weight.target_path}_scale",
+            sources=tuple(s.replace(".weight", ".weight_scale_inv") for s in spec.sources),
+            sharding=(("data", "tensor"), None, None),
+            transpose=True,
+        )
+        mappings[weight.target_path] = weight
+        mappings[scale.target_path] = scale
 
 
 def _ple_mappings(src: str, dst: str, text_cfg) -> dict:
