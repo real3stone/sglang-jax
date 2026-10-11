@@ -97,6 +97,10 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
         ngram_vocab_size_base: int = 20_000_000,
         make_ngram_vocab_size_divisible_by: int = 128,
         split_ngram_parts: int = 128,
+        # Keep the N-gram table in host memory instead of HBM. The host lookup
+        # needs each step's tokens before the step runs, which rules out
+        # overlap scheduling.
+        ple_offload_embedding: bool = False,
         # QSA (Qwen Sparse Attention). All-or-nothing; see _validate_qsa.
         indexer_budget: int | None = None,
         indexer_compress_ratio: int | None = None,
@@ -184,6 +188,7 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
         self.ngram_vocab_size_base = ngram_vocab_size_base
         self.make_ngram_vocab_size_divisible_by = make_ngram_vocab_size_divisible_by
         self.split_ngram_parts = split_ngram_parts
+        self.ple_offload_embedding = ple_offload_embedding
 
         # QSA.
         self.indexer_budget = indexer_budget
@@ -313,6 +318,11 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
     def ngram_context_len(self) -> int:
         """Previous token ids the N-gram layer keeps to form its keys."""
         return max(self.ngram_size - 1, 0) if self.ple_layer_ids else 0
+
+    @property
+    def ple_table_on_device(self) -> bool:
+        """Whether the N-gram table sits in HBM and the model looks it up."""
+        return bool(self.ple_layer_ids) and not self.ple_offload_embedding
 
     @property
     def short_conv_layer_ids(self) -> list[int]:

@@ -355,17 +355,22 @@ class Scheduler(
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
 
-        # N-gram PLE hashes real token ids on the host; overlap and spec decode do not
-        # pass them yet. Write the flag back: _recurrent_ping_pong_slots reads it.
-        if getattr(self.model_config.hf_text_config, "ple_layer_ids", None):
+        # N-gram PLE hashes each step's real token ids. A table in HBM is looked
+        # up on the device, after overlap scheduling resolves the tokens there;
+        # a host table needs them before the step runs, so overlap goes off.
+        # Spec decode does not pass draft tokens yet. Write the flag back:
+        # _recurrent_ping_pong_slots reads it.
+        text_config = self.model_config.hf_text_config
+        if getattr(text_config, "ple_layer_ids", None):
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                 raise NotImplementedError("N-gram PLE does not support speculative decoding yet.")
             if server_args.disaggregation_enable_overlap_schedule:
                 raise ValueError("N-gram PLE does not support PD scheduler overlap yet.")
-            if self.enable_overlap:
-                logger.info("Overlap scheduler is disabled for N-gram PLE models.")
-            self.enable_overlap = False
-            server_args.disable_overlap_schedule = True
+            if not getattr(text_config, "ple_table_on_device", False):
+                if self.enable_overlap:
+                    logger.info("Overlap scheduler is disabled for a host-side N-gram table.")
+                self.enable_overlap = False
+                server_args.disable_overlap_schedule = True
 
         # init distribution
         if self.nnodes > 1:

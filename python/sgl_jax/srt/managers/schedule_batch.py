@@ -2328,9 +2328,10 @@ class ScheduleBatch:
         input_ids_cpu: np.ndarray,
     ) -> np.ndarray | None:
         """Host-side PLE lookup; only [total_token_size, ple_embed_dim] crosses
-        to the device (see ngram_table.py). None when no table is installed."""
+        to the device (see ngram_table.py). None when no table is installed, or
+        when it is in HBM and the model looks it up."""
         table = get_ngram_table()
-        if table is None:
+        if table is None or table.on_device:
             return None
 
         params = table.params
@@ -2383,6 +2384,35 @@ class ScheduleBatch:
 
         # One gather over the padded batch; padded rows read row 0 and are discarded.
         return table.gather(ids)
+
+    def _merge_ngram_context(self, per_dp_bs_size: int, total_bs: int) -> np.ndarray | None:
+        """Each request's N-gram context for a table in HBM: the ngram_size - 1
+        tokens before its chunk, laid out like the other per-request arrays.
+        The model hashes the step's tokens against them on the device, where
+        overlap scheduling has already resolved those tokens."""
+        table = get_ngram_table()
+        if table is None or not table.on_device:
+            return None
+        params = table.params
+        context = np.full((total_bs, params.ngram_context_len), params.eos_token_id, dtype=np.int32)
+        is_extend = self.forward_mode.is_extend()
+        offset = 0
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            if info.reqs and info.seq_lens is not None:
+                for i, req in enumerate(info.reqs):
+                    chunk_start = (
+                        int(info.prefix_lens[i]) if is_extend else int(info.seq_lens[i]) - 1
+                    )
+                    context[offset + i] = ngram_context_row_split(
+                        req.origin_input_ids,
+                        req.output_ids,
+                        chunk_start,
+                        params.ngram_context_len,
+                        params.eos_token_id,
+                    )
+            offset += per_dp_bs_size
+        return context
 
     def _merge_batch_metadata(
         self,
@@ -3296,6 +3326,7 @@ class ScheduleBatch:
         ple_embeddings = self._merge_ngram_ple(
             per_dp_token_padding, total_token_size, input_ids_cpu
         )
+        ngram_context = self._merge_ngram_context(per_dp_bs_padding, total_bs)
         # Keep items whose placeholder rows intersect the current prefill window.
         if self.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             multimodal_batch = build_multimodal_batch(
@@ -3422,6 +3453,7 @@ class ScheduleBatch:
             recurrent_track_mask=recurrent_track_mask_cpu,
             has_initial_state=has_initial_state_cpu,
             ple_embeddings=ple_embeddings,
+            ngram_context=ngram_context,
             spec_algorithm=self.spec_algorithm,
         )
 
@@ -3874,6 +3906,9 @@ class ModelWorkerBatch:
 
     # [num_tokens, ple_embed_dim]
     ple_embeddings: np.ndarray | None = None
+
+    # [batch_size, ngram_size - 1]
+    ngram_context: np.ndarray | None = None
 
     # Recurrent state indices for hybrid recurrent models
     recurrent_indices: np.ndarray | None = None

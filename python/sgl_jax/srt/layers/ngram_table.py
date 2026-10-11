@@ -9,6 +9,7 @@ thread count with the row count.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -80,7 +81,10 @@ class NGramTable:
         padded_rows: int | None = None,
         dtype: str = "bfloat16",
         scale: float = 1.0,
+        allocate: bool = True,
     ):
+        """``allocate=False`` keeps only the hash layout, for a table whose
+        rows live on the device."""
         if dtype not in _STORAGE:
             raise ValueError(f"unsupported N-gram table dtype {dtype!r}")
         self.params = params
@@ -104,14 +108,19 @@ class NGramTable:
             raise ValueError(
                 f"padded_rows {self.padded_rows} is smaller than the table's {self.rows}"
             )
-        self.data = np.zeros((self.padded_rows, self.dim), dtype=_STORAGE[dtype])
+        # Set once the rows are in HBM; the scheduler then sends each
+        # request's context instead of gathered rows.
+        self.on_device = False
         self._pool: ThreadPoolExecutor | None = None
-        logger.info(
-            "N-gram table allocated: %s rows x %d = %.1f GiB host RAM",
-            f"{self.padded_rows:,}",
-            self.dim,
-            self.data.nbytes / 2**30,
-        )
+        self.data = None
+        if allocate:
+            self.data = np.zeros((self.padded_rows, self.dim), dtype=_STORAGE[dtype])
+            logger.info(
+                "N-gram table allocated: %s rows x %d = %.1f GiB host RAM",
+                f"{self.padded_rows:,}",
+                self.dim,
+                self.data.nbytes / 2**30,
+            )
 
     # -- gather --------------------------------------------------------------
 
@@ -183,17 +192,7 @@ class NGramTable:
         index's weight_map (tensor name -> safetensors file)."""
         from safetensors import safe_open
 
-        params = build_hash_params(
-            ngram_size=config.ngram_size,
-            heads_per_ngram=config.heads_per_ngram,
-            vocab_size=config.vocab_size,
-            ngram_vocab_size_base=config.ngram_vocab_size_base,
-            eos_token_id=_eos_token_id(config),
-            ple_dense_layer_id=ple_dense_layer_id,
-        )
-        divisor = int(config.make_ngram_vocab_size_divisible_by)  # 128
-        padded = ((params.total_vocab_size + divisor - 1) // divisor) * divisor  # 320,001,536
-        dim = int(config.ple_embed_dim) // params.ngram_heads  # 2560 // 16 = 160
+        params, dim, padded = ngram_table_layout(config, ple_dense_layer_id)
         # The FP8 checkpoint ships one scale for the whole table.
         scale_name = f"{prefix}.ngram_embedding.weight_scale"
         if scale_name in weight_files:
@@ -362,7 +361,16 @@ class NGramTable:
 
 def device_rows(table: NGramTable, mesh: jax.sharding.Mesh) -> jax.Array:
     """The table's rows on the device, split by rows over the tensor axis."""
-    return jax.device_put(table.data, NamedSharding(mesh, P("tensor", None)))
+    rows = jax.device_put(table.data, NamedSharding(mesh, P("tensor", None)))
+    devices = mesh.shape["tensor"]
+    logger.info(
+        "N-gram table placed in HBM: %s rows x %d split over %d devices, %.1f GiB each",
+        f"{table.padded_rows:,}",
+        table.dim,
+        devices,
+        table.data.nbytes / devices / 2**30,
+    )
+    return rows
 
 
 def gather_on_device(
@@ -452,6 +460,57 @@ def _read_raw(path: str | Path, name: str) -> np.ndarray:
     return data.reshape(info["shape"])
 
 
+def ngram_table_layout(config, ple_dense_layer_id: int = 0) -> tuple[NGramHashParams, int, int]:
+    """A PLE layer's table: its hash layout, row width and padded height.
+
+    The exporter pads the height to ``make_ngram_vocab_size_divisible_by``
+    (320,001,536 rows for the released table) and each row is one head's
+    ``ple_embed_dim // ngram_heads`` values (160).
+    """
+    return _table_layout(
+        int(config.ngram_size),
+        int(config.heads_per_ngram),
+        int(config.vocab_size),
+        int(config.ngram_vocab_size_base),
+        _eos_token_id(config),
+        int(config.make_ngram_vocab_size_divisible_by),
+        int(config.ple_embed_dim),
+        ple_dense_layer_id,
+    )
+
+
+def ngram_table_shape(config) -> tuple[int, int]:
+    """``(padded rows, row width)`` of a PLE layer's table; the hash's EOS
+    barrier does not change it, so the config need not name one."""
+    _, dim, padded = _table_layout(
+        int(config.ngram_size),
+        int(config.heads_per_ngram),
+        int(config.vocab_size),
+        int(config.ngram_vocab_size_base),
+        0,
+        int(config.make_ngram_vocab_size_divisible_by),
+        int(config.ple_embed_dim),
+        0,
+    )
+    return padded, dim
+
+
+@functools.lru_cache(maxsize=8)
+def _table_layout(
+    ngram_size, heads_per_ngram, vocab_size, vocab_base, eos, divisor, embed_dim, layer_id
+):
+    params = build_hash_params(
+        ngram_size=ngram_size,
+        heads_per_ngram=heads_per_ngram,
+        vocab_size=vocab_size,
+        ngram_vocab_size_base=vocab_base,
+        eos_token_id=eos,
+        ple_dense_layer_id=layer_id,
+    )
+    padded = (params.total_vocab_size + divisor - 1) // divisor * divisor
+    return params, embed_dim // params.ngram_heads, padded
+
+
 def _eos_token_id(config) -> int:
     eos = getattr(config, "eos_token_id", None)
     if isinstance(eos, (list, tuple)):
@@ -484,6 +543,8 @@ __all__ = [
     "device_rows",
     "gather_on_device",
     "get_ngram_table",
+    "ngram_table_layout",
+    "ngram_table_shape",
     "set_ngram_table",
     "shard_placements",
 ]

@@ -38,8 +38,15 @@ from sgl_jax.srt.layers.hyperconnection import GatedResidual, HyperConnectionCon
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.moe import create_moe_weights_mapping
-from sgl_jax.srt.layers.ngram_embedding import NGramEmbedding
-from sgl_jax.srt.layers.ngram_table import NGramTable, set_ngram_table
+from sgl_jax.srt.layers.ngram_embedding import NGramEmbedding, compute_ngram_ids_jax
+from sgl_jax.srt.layers.ngram_table import (
+    NGramTable,
+    device_rows,
+    gather_on_device,
+    ngram_table_layout,
+    ngram_table_shape,
+    set_ngram_table,
+)
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.recurrent_state_pool import SHORT_CONV
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -225,6 +232,11 @@ def _hc_config(text_cfg: PretrainedConfig, mesh, dtype) -> HyperConnectionConfig
     )
 
 
+class NGramRows(nnx.Variable):
+    """The N-gram table's rows, or their scale, in HBM: model state that the
+    table loader fills, not a checkpoint parameter."""
+
+
 class Qwen4ExpDecoderLayer(nnx.Module):
     """One backbone layer: an attention-family block and an MLP block, each
     wrapped in its own hyper connection.
@@ -259,6 +271,23 @@ class Qwen4ExpDecoderLayer(nnx.Module):
             if (layer_id + 1) in text_cfg.ple_layer_ids
             else None
         )
+        # With the table in HBM this layer holds its rows, split by rows over
+        # the tensor axis, as placeholders the table loader fills. The FP8
+        # checkpoint ships one-byte rows and a scale; the bf16 one, raw bf16.
+        self.ple_on_device = self.ple is not None and text_cfg.ple_table_on_device
+        if self.ple_on_device:
+            self.mesh = mesh
+            self.text_cfg = text_cfg
+            padded, dim = ngram_table_shape(text_cfg)
+            storage = jnp.uint8 if _static_fp8(config) else jnp.uint16
+            self.ple_rows = NGramRows(
+                jax.ShapeDtypeStruct(
+                    (padded, dim), storage, sharding=NamedSharding(mesh, P("tensor", None))
+                )
+            )
+            self.ple_scale = NGramRows(
+                jax.ShapeDtypeStruct((), jnp.float32, sharding=NamedSharding(mesh, P()))
+            )
 
         if self.is_moe:
             self.mlp = Qwen3_5MoeBlock(config, mesh, layer_id, dtype=dtype)
@@ -338,6 +367,11 @@ class Qwen4ExpDecoderLayer(nnx.Module):
         """
         metadata = forward_batch.attn_backend.linear_attn_backend.forward_metadata
         conv_state = pool.get_short_conv_state(self.layer_id)
+        ple_embeddings = (
+            self._lookup_ngram_rows(forward_batch, metadata)
+            if self.ple_on_device
+            else forward_batch.ple_embeddings
+        )
         track = dict(
             track_indices=metadata.recurrent_track_indices,
             track_mask=metadata.recurrent_track_mask,
@@ -345,7 +379,7 @@ class Qwen4ExpDecoderLayer(nnx.Module):
         if forward_batch.forward_mode.is_decode():
             return self.ple.forward_decode(
                 hidden_states,
-                forward_batch.ple_embeddings,
+                ple_embeddings,
                 conv_state,
                 metadata.recurrent_indices,
                 metadata.has_initial_state,
@@ -353,13 +387,35 @@ class Qwen4ExpDecoderLayer(nnx.Module):
             )
         return self.ple.forward_extend(
             hidden_states,
-            forward_batch.ple_embeddings,
+            ple_embeddings,
             conv_state,
             metadata.recurrent_indices,
             metadata.cu_q_lens,
             metadata.has_initial_state,
             **track,
         )
+
+    def _lookup_ngram_rows(self, forward_batch, metadata):
+        """The batch's ple_embeddings from the table in HBM.
+
+        Each data-parallel rank hashes its own tokens against its requests'
+        context rows; the tokens are read here, after overlap scheduling has
+        resolved them on the device.
+        """
+        params, _, _ = ngram_table_layout(self.text_cfg)
+        decode = forward_batch.forward_mode.is_decode()
+
+        def hash_rank(tokens, context, *cu_seqlens):
+            return compute_ngram_ids_jax(tokens, context, params, *cu_seqlens)
+
+        args = (forward_batch.input_ids, forward_batch.ngram_context)
+        specs = (P("data"), P("data", None))
+        if not decode:
+            args, specs = args + (metadata.cu_q_lens,), specs + (P("data"),)
+        ids = jax.shard_map(
+            hash_rank, mesh=self.mesh, in_specs=specs, out_specs=P("data", None), check_vma=False
+        )(*args)
+        return gather_on_device(self.ple_rows.value, ids, self.ple_scale.value, self.mesh)
 
     def _with_ple_conv_state(self, attn_state, conv_state, pool):
         """Put the short conv's new state into the list GDN returned.
@@ -512,8 +568,41 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
 
     def load_weights(self, model_config):
         super().load_weights(model_config)
-        if not getattr(model_config, "_dummy_mode", False):
+        dummy = getattr(model_config, "_dummy_mode", False)
+        if model_config.hf_config.text_config.ple_table_on_device:
+            self._place_ngram_table(None if dummy else _install_ngram_table(model_config))
+        elif not dummy:
             _install_ngram_table(model_config)
+
+    def _place_ngram_table(self, table: NGramTable | None) -> None:
+        """Move the table's rows into HBM, or zeros under dummy weights, and
+        leave the host only its hash layout, which the scheduler's context
+        rows need."""
+        tc = self.config.text_config
+        layer = self.language_model.model.layers[tc.short_conv_layer_ids[0]]
+        placeholder = layer.ple_rows.value
+        params, dim, padded = ngram_table_layout(tc)
+        if table is None:
+            dtype = "float8_e4m3fn" if placeholder.dtype == jnp.uint8 else "bfloat16"
+            table = NGramTable(params, dim, padded_rows=padded, dtype=dtype, allocate=False)
+            rows = jax.jit(
+                lambda: jnp.zeros(placeholder.shape, placeholder.dtype),
+                out_shardings=placeholder.sharding,
+            )()
+        else:
+            if table.data.dtype != placeholder.dtype:
+                raise ValueError(
+                    f"the checkpoint's N-gram table is {table.dtype}, but the model was "
+                    f"built for {placeholder.dtype} rows"
+                )
+            rows = device_rows(table, self.mesh)
+        layer.ple_rows.value = rows
+        layer.ple_scale.value = jax.device_put(
+            jnp.float32(table.scale), NamedSharding(self.mesh, P())
+        )
+        table.data = None
+        table.on_device = True
+        set_ngram_table(table)
 
 
 EntryClass = [Qwen4ExpForConditionalGeneration]
@@ -674,18 +763,15 @@ def _ple_mappings(src: str, dst: str, text_cfg) -> dict:
     return out
 
 
-def _install_ngram_table(model_config) -> None:
-    """Stream the N-gram table into host memory for the scheduler's lookup.
-
-    The table stays off the device (``ngram_table.py``): the scheduler gathers
-    each batch's rows on the host and only those reach the model.
-    """
+def _install_ngram_table(model_config) -> NGramTable | None:
+    """Stream the N-gram table into host memory and install it for the
+    scheduler; returns it, or None for a model without an N-gram layer."""
     from sgl_jax.srt.model_loader.weights.source import LocalSource
 
     tc = model_config.hf_config.text_config
     layers = tc.short_conv_layer_ids
     if not layers:
-        return
+        return None
     if len(layers) != 1:
         raise NotImplementedError(
             f"the N-gram table is one per process, but layers {layers} each carry one"
@@ -693,8 +779,13 @@ def _install_ngram_table(model_config) -> None:
     weight_files = {
         name: infos[0]["file"] for name, infos in LocalSource(model_config).metadata.items()
     }
-    set_ngram_table(
-        NGramTable.from_safetensors(
-            weight_files, tc, prefix=f"model.language_model.layers.{layers[0]}.ple.ple_embedding"
-        )
+    table = NGramTable.from_safetensors(
+        weight_files, tc, prefix=f"model.language_model.layers.{layers[0]}.ple.ple_embedding"
     )
+    set_ngram_table(table)
+    return table
+
+
+def _static_fp8(config) -> bool:
+    quant = getattr(config, "quantization_config", None)
+    return quant is not None and getattr(quant, "is_static_checkpoint", False)

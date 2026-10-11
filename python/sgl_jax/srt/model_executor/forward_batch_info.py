@@ -215,6 +215,8 @@ class ForwardBatch:
 
     # [num_tokens, ple_embed_dim], gathered on the host.
     ple_embeddings: jax.Array | None = None
+    # [batch_size, ngram_size - 1], for an N-gram table in HBM.
+    ngram_context: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -242,6 +244,7 @@ class ForwardBatch:
             self.recurrent_track_indices,
             self.recurrent_track_mask,
             self.ple_embeddings,
+            self.ngram_context,
         )
 
         aux_data = {
@@ -294,6 +297,7 @@ class ForwardBatch:
         obj.recurrent_track_indices = children[21]
         obj.recurrent_track_mask = children[22]
         obj.ple_embeddings = children[23]
+        obj.ngram_context = children[24]
         return obj
 
     def __repr__(self) -> str:
@@ -470,18 +474,30 @@ class ForwardBatch:
                 sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 
-        ple_embeddings = batch.ple_embeddings
+        ple_embeddings, ngram_context = batch.ple_embeddings, batch.ngram_context
         text_config = getattr(getattr(model_runner, "model_config", None), "hf_text_config", None)
-        if ple_embeddings is None and getattr(text_config, "ple_layer_ids", None):
+        if getattr(text_config, "ple_layer_ids", None):
             if get_ngram_table() is None:
                 raise RuntimeError("Model has N-gram PLE layers but no N-gram table is installed.")
-            # Precompile batches skip _merge_ngram_ple; zeros keep the served treedef.
-            ple_embeddings = np.zeros(
-                (len(batch.input_ids), int(text_config.ple_embed_dim)), jnp.bfloat16
-            )
+            # Precompile batches skip the scheduler's N-gram merge; zeros keep
+            # the served treedef.
+            if getattr(text_config, "ple_table_on_device", False):
+                if ngram_context is None:
+                    ngram_context = np.zeros(
+                        (len(batch.seq_lens), int(text_config.ngram_size) - 1), np.int32
+                    )
+            elif ple_embeddings is None:
+                ple_embeddings = np.zeros(
+                    (len(batch.input_ids), int(text_config.ple_embed_dim)), jnp.bfloat16
+                )
         if ple_embeddings is not None:  # [T, ple_embed_dim]
             (ple_embeddings,) = device_array(
                 (ple_embeddings,),
+                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
+            )
+        if ngram_context is not None:  # [B, ngram_size - 1]
+            (ngram_context,) = device_array(
+                (ngram_context,),
                 sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 
@@ -515,6 +531,7 @@ class ForwardBatch:
             recurrent_track_indices=recurrent_track_indices,
             recurrent_track_mask=recurrent_track_mask,
             ple_embeddings=ple_embeddings,
+            ngram_context=ngram_context,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

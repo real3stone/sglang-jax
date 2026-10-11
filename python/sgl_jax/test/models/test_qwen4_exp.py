@@ -37,9 +37,13 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
 from sgl_jax.srt.layers.attention.qsa_sparse_backend import QSAFusedCache
 from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, RotaryEmbedding
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
-from sgl_jax.srt.layers.ngram_embedding import build_hash_params
+from sgl_jax.srt.layers.ngram_embedding import build_hash_params, compute_ngram_ids
 from sgl_jax.srt.layers.ngram_table import (
+    NGramTable,
+    device_rows,
     get_ngram_table,
+    ngram_table_layout,
+    ngram_table_shape,
     set_ngram_table,
     shard_placements,
 )
@@ -347,10 +351,12 @@ class TestNGramLayer(CustomTestCase):
 
     def setUp(self):
         self.mesh = _mesh()
-        tc = _config(ple=True).text_config
+        # The batch hands the layer its gathered rows, as with a host table.
+        cfg = _config(ple=True, ple_offload_embedding=True)
+        tc = cfg.text_config
         with jax.set_mesh(self.mesh):
             self.layer = Qwen4ExpDecoderLayer(
-                _config(ple=True), self.mesh, PLE_LAYER_1BASED - 1, dtype=jnp.float32
+                cfg, self.mesh, PLE_LAYER_1BASED - 1, dtype=jnp.float32
             )
         rng = np.random.default_rng(0)
         for _, param in nnx.to_flat_state(nnx.state(self.layer.ple, nnx.Param)):
@@ -455,6 +461,74 @@ class TestNGramLayer(CustomTestCase):
                     np.testing.assert_array_equal(
                         state[self.TRACK], state[self.SLOT] if boundary else held
                     )
+
+
+class TestNGramTableOnDevice(CustomTestCase):
+    """With the table in HBM the layer hashes the step's tokens itself and
+    looks its rows up there."""
+
+    EOS = 7
+
+    def _config(self):
+        return _config(ple=True, ngram_vocab_size_base=1000, eos_token_id=self.EOS)
+
+    def test_the_device_lookup_is_the_host_lookup(self):
+        """Hashing on the device against each request's context rows, then
+        reading the rows from HBM, must give what the host hash and gather
+        give: for a decode batch and a ragged extend, across an EOS."""
+        mesh, cfg = _mesh(), self._config()
+        tc = cfg.text_config
+        with jax.set_mesh(mesh):
+            layer = Qwen4ExpDecoderLayer(cfg, mesh, PLE_LAYER_1BASED - 1, dtype=jnp.float32)
+        params, dim, padded = ngram_table_layout(tc)
+        rng = np.random.default_rng(0)
+        table = NGramTable(params, dim, padded_rows=padded)
+        table.data[:] = (
+            rng.standard_normal(table.data.shape).astype(ml_dtypes.bfloat16).view(np.uint16)
+        )
+        layer.ple_rows.value = device_rows(table, mesh)
+        layer.ple_scale.value = jnp.float32(1.0)
+
+        def put(x):
+            return jax.device_put(jnp.asarray(x), NamedSharding(mesh, P("data")))
+
+        for lens in ([1] * 5, [6, 1, 4]):
+            with self.subTest(lens=lens):
+                decode = all(n == 1 for n in lens)
+                cu = np.r_[0, np.cumsum(lens)].astype(np.int32)
+                tokens = rng.integers(0, tc.vocab_size, int(cu[-1])).astype(np.int32)
+                tokens[1] = self.EOS
+                context = rng.integers(0, tc.vocab_size, (len(lens), tc.ngram_size - 1))
+                context = context.astype(np.int32)
+                batch = types.SimpleNamespace(
+                    forward_mode=types.SimpleNamespace(is_decode=lambda decode=decode: decode),
+                    input_ids=put(tokens),
+                    ngram_context=jax.device_put(context, NamedSharding(mesh, P("data", None))),
+                )
+                metadata = types.SimpleNamespace(cu_q_lens=None if decode else put(cu))
+                with jax.set_mesh(mesh):
+                    got = layer._lookup_ngram_rows(batch, metadata)
+                want = table.gather(compute_ngram_ids(tokens, cu, context, params))
+                np.testing.assert_array_equal(np.asarray(got).view(np.uint16), want.view(np.uint16))
+
+    def test_dummy_weights_place_zero_rows_and_keep_the_layout(self):
+        """Under dummy weights there is no table to read: the rows are zeros
+        in HBM, and the host keeps only the hash layout for the scheduler."""
+        mesh, cfg = _mesh(), self._config()
+        with jax.set_mesh(mesh):
+            model = Qwen4ExpForConditionalGeneration(cfg, mesh, dtype=jnp.float32)
+        try:
+            model._place_ngram_table(None)
+            layer = model.language_model.model.layers[PLE_LAYER_1BASED - 1]
+            rows = layer.ple_rows.value
+            self.assertEqual(rows.shape, ngram_table_shape(cfg.text_config))
+            self.assertEqual(rows.sharding.spec, P("tensor", None))
+            self.assertFalse(np.asarray(rows).any())
+            table = get_ngram_table()
+            self.assertTrue(table.on_device)
+            self.assertIsNone(table.data)
+        finally:
+            set_ngram_table(None)
 
 
 class TestNGramTableInstall(CustomTestCase):

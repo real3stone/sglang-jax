@@ -349,7 +349,7 @@ class TestSchedulerHandoff(CustomTestCase):
             )
         return batch
 
-    def _handoff(self, batch, ids, embeddings):
+    def _handoff(self, batch, ids, embeddings, context=None, text_config=None):
         import jax
 
         from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -396,16 +396,21 @@ class TestSchedulerHandoff(CustomTestCase):
             dp_size=batch.dp_size,
             per_dp_bs_size=per_dp_bs,
             ple_embeddings=embeddings,
+            ngram_context=context,
         )
         runner = SimpleNamespace(
             mesh=_make_mesh(),
             attn_backend=None,
             model_config=SimpleNamespace(
-                is_embedding=False, hf_config=SimpleNamespace(architectures=[])
+                is_embedding=False,
+                hf_config=SimpleNamespace(architectures=[]),
+                hf_text_config=text_config,
             ),
         )
         forward = ForwardBatch.init_new(worker, runner)
         back = jax.jit(lambda fb: fb)(forward)  # exercises the actual pytree/JIT handoff
+        if text_config is not None:
+            return back  # the caller checks what init_new filled in
         if embeddings is None:
             self.assertIsNone(back.ple_embeddings)
         else:
@@ -414,6 +419,11 @@ class TestSchedulerHandoff(CustomTestCase):
                 np.asarray(back.ple_embeddings).view(np.uint16), embeddings.view(np.uint16)
             )
             self.assertEqual(back.ple_embeddings.sharding.spec[0], "data")
+        if context is None:
+            self.assertIsNone(back.ngram_context)
+        else:
+            np.testing.assert_array_equal(np.asarray(back.ngram_context), context)
+            self.assertEqual(back.ngram_context.sharding.spec[0], "data")
 
     def test_dp_padding_context_and_forward_batch(self):
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
@@ -466,6 +476,114 @@ class TestSchedulerHandoff(CustomTestCase):
                     want = table.data[expected_ids].reshape(len(ids), PLE_EMBED_DIM)
                     np.testing.assert_array_equal(embeddings.view(np.uint16), want)
                     self._handoff(batch, ids, embeddings)
+
+    def test_a_device_table_gets_context_rows_under_overlap(self):
+        """Under overlap scheduling a decode row's token is still on the
+        device when the batch is built, and output_ids stops one token short
+        of it. With the table in HBM the host sends only each request's
+        context rows; hashing the resolved tokens against them on the device
+        must give the ids of the whole stream, for decode and for an extend
+        mixed with a decode row."""
+        from sgl_jax.srt.layers.ngram_embedding import compute_ngram_ids_jax
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+        from sgl_jax.test.layers.test_ngram_embedding import _ref_ngram_ids
+
+        params = _params()
+        dim = PLE_EMBED_DIM // HEADS
+        table = NGramTable(params, dim, allocate=False)
+        table.on_device = True
+        # (prompt, output_ids so far, the step's tokens) per request; a decode
+        # row's one token is the one the host does not have.
+        cases = (
+            (
+                ForwardMode.DECODE,
+                [
+                    [([10, 11, EOS, 13, 14], [15, 16], [17]), ([EOS, 22], [23], [24])],
+                    [],
+                    [([41, 42], [43, 44, 45], [46])],
+                ],
+            ),
+            (
+                ForwardMode.EXTEND,
+                [[([10, 11, EOS, 13, 14], [], [EOS, 13, 14]), ([21, 22], [23, 24], [25])]],
+            ),
+        )
+        for mode, ranks in cases:
+            with self.subTest(mode=mode):
+                schedule_ranks, per_dp_bs = [], max(len(r) for r in ranks)
+                for requests in ranks:
+                    rows = []
+                    for prompt, output, step in requests:
+                        known = prompt + output
+                        start = len(known) if len(step) == 1 else len(prompt) - len(step)
+                        rows.append((prompt, output, start, len(step)))
+                    schedule_ranks.append(rows)
+                batch = self._schedule(mode, schedule_ranks)
+                with patch(
+                    "sgl_jax.srt.managers.schedule_batch.get_ngram_table", return_value=table
+                ):
+                    self.assertIsNone(batch._merge_ngram_ple(per_dp_bs, per_dp_bs, None))
+                    context = batch._merge_ngram_context(per_dp_bs, per_dp_bs * len(ranks))
+
+                tokens = []
+                for rank, (requests, rows) in enumerate(zip(ranks, schedule_ranks)):
+                    lens = [len(step) for _, _, step in requests] + [0] * (
+                        per_dp_bs - len(requests)
+                    )
+                    cu = np.r_[0, np.cumsum(lens)].astype(np.int32)
+                    step_tokens = np.array(
+                        [t for _, _, step in requests for t in step] or [0], np.int32
+                    )
+                    got = compute_ngram_ids_jax(
+                        step_tokens,
+                        context[rank * per_dp_bs : (rank + 1) * per_dp_bs],
+                        params,
+                        None if mode.is_decode() else cu,
+                    )
+                    want = []
+                    for (prompt, output, step), (_, _, start, length) in zip(requests, rows):
+                        stream = prompt + output + (step if len(step) == 1 else [])
+                        whole = _ref_ngram_ids(
+                            stream, [0, len(stream)], [[EOS] * (NGRAM_SIZE - 1)], params
+                        )
+                        want.append(whole[start : start + length])
+                    if want:
+                        n = sum(len(w) for w in want)
+                        np.testing.assert_array_equal(np.asarray(got)[:n], np.concatenate(want))
+                    tokens.extend(step_tokens.tolist())
+                self._handoff(batch, np.asarray(tokens, np.int32), None, context)
+
+    def test_precompile_batches_get_zeros_of_the_served_shape(self):
+        """Precompile batches skip the scheduler's N-gram merge, so init_new
+        fills in zeros of the served shape: context rows for a table in HBM,
+        embedding rows for one on the host."""
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+        batch = self._schedule(ForwardMode.DECODE, [[([1, 2], [3], 3, 1)], [([4], [5, 6], 3, 1)]])
+        ids = np.array([7, 8], np.int32)
+        lookup = "sgl_jax.srt.model_executor.forward_batch_info.get_ngram_table"
+        for on_device in (True, False):
+            with self.subTest(on_device=on_device):
+                text_config = SimpleNamespace(
+                    ple_layer_ids=[1],
+                    ple_table_on_device=on_device,
+                    ngram_size=NGRAM_SIZE,
+                    ple_embed_dim=PLE_EMBED_DIM,
+                )
+                with patch(lookup, return_value=object()):
+                    back = self._handoff(batch, ids, None, text_config=text_config)
+                if on_device:
+                    filled, absent, want = back.ngram_context, back.ple_embeddings, np.int32
+                    shape = (2, NGRAM_SIZE - 1)
+                else:
+                    filled, absent, want = back.ple_embeddings, back.ngram_context, jnp.bfloat16
+                    shape = (2, PLE_EMBED_DIM)
+                self.assertIsNone(absent)
+                self.assertEqual((filled.shape, filled.dtype), (shape, want))
+                self.assertFalse(np.asarray(filled).any())
+                self.assertEqual(filled.sharding.spec[0], "data")
+                with patch(lookup, return_value=None), self.assertRaises(RuntimeError):
+                    self._handoff(batch, ids, None, text_config=text_config)
 
     def test_absent_table_and_stale_stream(self):
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
