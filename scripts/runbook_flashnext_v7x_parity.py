@@ -73,7 +73,7 @@ checkpoint；A1 另外带上 cookbook 的两个 parser，Part D 不带 --disable
   D3  同 C6 的三组压测。和 C6 的差就是这一步的收益。
   D4  同 A5。
   D5  bf16 checkpoint 启动，只做启动检查：加载摘要同 A1，日志里有 "... split over 8 devices,
-      11.9 GiB each"，冒烟请求正常，记下 KV 池容量。
+      11.9 GiB each"、没有 "Overlap scheduler is disabled"，冒烟请求正常，记下 KV 池容量。
   Part D 的阶段失败时，报告里附上服务日志的最后几十行。
 
   评测都放在子进程里跑，同时盯着服务进程：服务一退出，评测就停下来，当前阶段记 FAIL。
@@ -678,7 +678,9 @@ def part_d(run: rb.Run, args, wanted: set[str]) -> None:
         rb.stage_launch(run, fp8, "qsa_sparse", steps, LAUNCH_OVERLAP, "d_fp8")
         attach_log_tail(run, [s for s, _ in steps], "d_fp8")
     if "D5" in wanted:
-        d5 = launch_step(run, "D5", s2.EXPECTED_LOAD_SUMMARY_PLE, required=(NGRAM_IN_HBM_BF16,))
+        d5 = launch_step(
+            run, "D5", s2.EXPECTED_LOAD_SUMMARY_PLE, None, (NGRAM_IN_HBM_BF16,), (OVERLAP_DISABLED,)
+        )
         rb.stage_launch(run, args, "qsa_sparse", [("D5", d5)], LAUNCH_OVERLAP, "d_bf16")
         attach_log_tail(run, ["D5"], "d_bf16")
 
