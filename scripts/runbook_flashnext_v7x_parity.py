@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next 在 TPU v7x 上的性能追平测试（R1）：同一套启动参数下，测四种组合的精度和
+"""Qwen3.8-Flash-Next 在 TPU v7x 上的性能追平测试（R1）：同一套启动参数下，测五种组合的精度和
 吞吐，并给官方 FP8 checkpoint 调 MoE 分块。
 
   A  基底 A（当前的模型代码）+ bf16 checkpoint：基线。启动命令和 cookbook §2.3 完全一致，
@@ -7,7 +7,9 @@
      和 A 的差就是稠密分支的收益。
   C  基底 B + 官方 FP8 checkpoint：先调 FP8 MoE 的分块，再测精度和吞吐。
   D  基底 D（N-gram 表放进 HBM、在设备上查表，overlap 调度打开）+ FP8 checkpoint，和 C 用同一套
-     MoE 分块：和 C 的差就是这一步的收益。最后用 bf16 checkpoint 再启动一次，确认表放得下。
+     MoE 分块：和 C 的差就是这一步的收益。
+  E  基底 E（GDN 输入投影按设备重排，共享专家每设备一份）+ FP8 checkpoint，同一套分块：和 D 的
+     差就是这两项的收益。最后用 bf16 checkpoint 再启动一次，确认表放得下。
 
 和 runbook_flashnext_v7x.py 用同一套环境（前置条件见那份脚本的说明），另外要求：
   * FP8 checkpoint：Hugging Face 上的 Qwen/Qwen3.8-Flash-Next-FP8（约 173 GiB，131 个
@@ -17,10 +19,10 @@
     都在 bring-up 分支的历史里），全部跑完再切回原来的分支。
 
 各次启动的参数相同（上下文 69632、64 个请求，和 cookbook §2.3 一致），只换代码和
-checkpoint；A1 另外带上 cookbook 的两个 parser，Part D 不带 --disable-overlap-schedule。
+checkpoint；A1 另外带上 cookbook 的两个 parser，Part D、E 不带 --disable-overlap-schedule。
 
 各阶段
-  E0  环境检查：runbook 的 C0 那几项（bf16 checkpoint；代码包含基底 D，也就包含了 A 和 B），
+  E0  环境检查：runbook 的 C0 那几项（bf16 checkpoint；代码包含基底 E，也就包含了 A、B、D），
       再加上：FP8 checkpoint 有 131 个 safetensors 文件，主机可用内存不少于 128 GiB，工作区
       没有未提交的改动。不满足就停。
 
@@ -72,9 +74,15 @@ checkpoint；A1 另外带上 cookbook 的两个 parser，Part D 不带 --disable
       两边的差应在采样噪声以内。
   D3  同 C6 的三组压测。和 C6 的差就是这一步的收益。
   D4  同 A5。
-  D5  bf16 checkpoint 启动，只做启动检查：加载摘要同 A1，日志里有 "... split over 8 devices,
+
+  Part E（基底 E，FP8，开 overlap）。和 D 一样，切过去之后把 C2 通过的条目重新写进调优表。
+  E1  启动，判定同 D1。KV 池容量和 D1 并排记下来：共享专家每设备多一份，应比 D1 略少。
+  E2  MMLU 冒烟，判定同 A3，并和 D2 逐题对比：GDN 投影的权重布局变了，这是它的正确性检查。
+  E3  同 D3 的三组压测。和 D3 的差就是这两项的收益。
+  E4  同 A5。
+  E5  bf16 checkpoint 启动，只做启动检查：加载摘要同 A1，日志里有 "... split over 8 devices,
       11.9 GiB each"、没有 "Overlap scheduler is disabled"，冒烟请求正常，记下 KV 池容量。
-  Part D 的阶段失败时，报告里附上服务日志的最后几十行。
+  Part D、E 的阶段失败时，报告里附上服务日志的最后几十行。
 
   评测都放在子进程里跑，同时盯着服务进程：服务一退出，评测就停下来，当前阶段记 FAIL。
   单个请求最多等 6 小时，超时就记下来、不重发；有请求出错时阶段判 WARN，出错数写进报告。
@@ -86,8 +94,8 @@ checkpoint；A1 另外带上 cookbook 的两个 parser，Part D 不带 --disable
   其余阶段不管什么结果都不用自己排查，把两个压缩包原样发回。
 
 时长：每次启动 20–30 分钟；Part A、B 各约 1 小时；C1 / C2 约 2–3 小时；GPQA 5 个 seed
-估计 4–8 小时；D1–D4 约 1.5–2 小时，D5 约 0.5 小时。合计一个半到两个晚上，放在 tmux / screen
-里或者用 nohup 跑。
+估计 4–8 小时；D1–D4、E1–E4 各约 1.5–2 小时，E5 约 0.5 小时。合计约 15–21 小时，放在 tmux /
+screen 里或者用 nohup 跑。
 
 用法：在 sglang-jax 仓库根目录下运行。
   python scripts/runbook_flashnext_v7x_parity.py --model-path /data/Qwen3.8-Flash-Next \\
@@ -122,9 +130,10 @@ PARTS = {
     "A": ("A1", "A2", "A3", "A4", "A5"),
     "B": ("B1", "B2", "B3", "B4"),
     "C": ("C1", "C2", "C3", "C4", "C5", "C6", "C7"),
-    "D": ("D1", "D2", "D3", "D4", "D5"),
+    "D": ("D1", "D2", "D3", "D4"),
+    "E": ("E1", "E2", "E3", "E4", "E5"),
 }
-STAGES = ("E0", *PARTS["A"], *PARTS["B"], *PARTS["C"], *PARTS["D"])
+STAGES = ("E0", *PARTS["A"], *PARTS["B"], *PARTS["C"], *PARTS["D"], *PARTS["E"])
 STAGE_INFO = {
     "E0": "环境检查：TPU 设备、两份 checkpoint、仓库和代码版本、主机内存、工作区干净",
     "A1": "基底 A + bf16 启动（cookbook 命令）：加载摘要、n-gram 表、出 token",
@@ -147,22 +156,28 @@ STAGE_INFO = {
     "D2": "MMLU 冒烟（基底 D，FP8），和 C4 逐题对比",
     "D3": "压测三组（基底 D，FP8）",
     "D4": "decode profile，vLLM 负载（基底 D，FP8）",
-    "D5": "基底 D + bf16 启动，开 overlap：只看表放不放得下",
+    "E1": "基底 E + FP8 启动，开 overlap：表在 HBM、overlap 没被关、KV 池容量",
+    "E2": "MMLU 冒烟（基底 E，FP8），和 D2 逐题对比",
+    "E3": "压测三组（基底 E，FP8）",
+    "E4": "decode profile，vLLM 负载（基底 E，FP8）",
+    "E5": "基底 E + bf16 启动，开 overlap：只看表放不放得下",
 }
 rb.STAGE_INFO.update(STAGE_INFO)  # stage_launch 和 stage2 的函数打印阶段标题时查这张表
 
-# 每部分的代码基底。D 是 rb.REQUIRED_COMMIT，A、B 是它的祖先
+# 每部分的代码基底。E 是 rb.REQUIRED_COMMIT，A、B、D 是它的祖先
 BASES = {
     "A": "429ed463",  # sgl-project/sglang-jax#1781 的 head
     "B": "8fe3d481",  # A 之上：预算以内走稠密注意力，加载 FP8 checkpoint
     "D": "b7f05c28",  # B 之上：N-gram 表放进 HBM、在设备上查表，overlap 调度不再关掉
+    "E": "7237449e",  # D 之上：GDN 输入投影按设备重排，共享专家每设备一份
 }
-PART_BASE = {"A": "A", "B": "B", "C": "B", "D": "D"}
+PART_BASE = {"A": "A", "B": "B", "C": "B", "D": "D", "E": "E"}
 PART_LABEL = {
     "A": "A：基底 A + bf16",
     "B": "B：基底 B + bf16",
     "C": "C：基底 B + FP8",
     "D": "D：基底 D + FP8，开 overlap",
+    "E": "E：基底 E + FP8，开 overlap",
 }
 
 MIN_MEM_AVAILABLE_GIB = 128  # bf16 的 n-gram 表 95.4 GiB，FP8 的 47.7 GiB，两次启动不同时在内存里
@@ -662,30 +677,41 @@ def part_c(run: rb.Run, args, wanted: set[str]) -> None:
     run.record("C7", status, decode=decode, prefill=prefill, prefill_profile=summary)
 
 
-def part_d(run: rb.Run, args, wanted: set[str]) -> None:
+def overlap_fp8(run: rb.Run, args, wanted: set[str], part: str, ref: str) -> None:
+    """<part>1–<part>4：写回 C2 的分块（和 C 用同一套），FP8 开 overlap 启动；MMLU 和 ref 逐题对比。"""
     fp8 = fp8_args(args)
-    rewrite_tuned(run, args)  # 和 C 用同一套分块，C → D 的差别只剩这一步
+    rewrite_tuned(run, args)
+    launch, mmlu, bench, profile = (f"{part}{i}" for i in range(1, 5))
     steps = [
-        ("D1", launch_step(
-            run, "D1", EXPECTED_LOAD_SUMMARY_FP8, "C2", (NGRAM_IN_HBM_FP8,), (OVERLAP_DISABLED,)
+        (launch, launch_step(
+            run, launch, EXPECTED_LOAD_SUMMARY_FP8, "C2", (NGRAM_IN_HBM_FP8,), (OVERLAP_DISABLED,)
         )),
-        ("D2", mmlu_step(run, fp8, "D2", ref="C4")),
-        ("D3", bench_step(run, fp8, "D3")),
-        ("D4", profile_step(run, fp8, "D4")),
+        (mmlu, mmlu_step(run, fp8, mmlu, ref=ref)),
+        (bench, bench_step(run, fp8, bench)),
+        (profile, profile_step(run, fp8, profile)),
     ]  # fmt: skip
     steps = [(s, fn) for s, fn in steps if s in wanted]
     if steps:
-        rb.stage_launch(run, fp8, "qsa_sparse", steps, LAUNCH_OVERLAP, "d_fp8")
-        attach_log_tail(run, [s for s, _ in steps], "d_fp8")
-    if "D5" in wanted:
-        d5 = launch_step(
-            run, "D5", s2.EXPECTED_LOAD_SUMMARY_PLE, None, (NGRAM_IN_HBM_BF16,), (OVERLAP_DISABLED,)
+        label = f"{part.lower()}_fp8"
+        rb.stage_launch(run, fp8, "qsa_sparse", steps, LAUNCH_OVERLAP, label)
+        attach_log_tail(run, [s for s, _ in steps], label)
+
+
+def part_d(run: rb.Run, args, wanted: set[str]) -> None:
+    overlap_fp8(run, args, wanted, "D", ref="C4")
+
+
+def part_e(run: rb.Run, args, wanted: set[str]) -> None:
+    overlap_fp8(run, args, wanted, "E", ref="D2")
+    if "E5" in wanted:
+        e5 = launch_step(
+            run, "E5", s2.EXPECTED_LOAD_SUMMARY_PLE, None, (NGRAM_IN_HBM_BF16,), (OVERLAP_DISABLED,)
         )
-        rb.stage_launch(run, args, "qsa_sparse", [("D5", d5)], LAUNCH_OVERLAP, "d_bf16")
-        attach_log_tail(run, ["D5"], "d_bf16")
+        rb.stage_launch(run, args, "qsa_sparse", [("E5", e5)], LAUNCH_OVERLAP, "e_bf16")
+        attach_log_tail(run, ["E5"], "e_bf16")
 
 
-PART_FNS = {"A": part_a, "B": part_b, "C": part_c, "D": part_d}
+PART_FNS = {"A": part_a, "B": part_b, "C": part_c, "D": part_d, "E": part_e}
 
 
 def run_part(run: rb.Run, args, part: str, wanted: set[str]) -> None:
@@ -718,21 +744,23 @@ def bench_of(r: dict, stage: str, cfg: dict) -> dict | None:
 
 def write_report(run: rb.Run, args, repo: dict) -> Path:
     r = run.results
-    perf_stage = {"A": "A4", "B": "B3", "C": "C6", "D": "D3"}
-    mmlu_stage = {"A": "A3", "B": "B2", "C": "C4", "D": "D2"}
+    perf_stage = {"A": "A4", "B": "B3", "C": "C6", "D": "D3", "E": "E3"}
+    mmlu_stage = {"A": "A3", "B": "B2", "C": "C4", "D": "D2", "E": "E2"}
     checkouts_path = run.out / "checkouts.json"
     checkouts = json.loads(checkouts_path.read_text()) if checkouts_path.exists() else []
     lines = ["# Qwen3.8-Flash-Next 性能追平测试（R1）", "", "## 1. 设计", ""]
     lines += ["| 组合 | 代码 | checkpoint |", "| --- | --- | --- |"]
     for part, label in PART_LABEL.items():
         heads = sorted({c["head"][:12] for c in checkouts if c["part"] == part})
-        ckpt = {"C": "官方 FP8", "D": "官方 FP8（D5 用 bf16，只做启动检查）"}.get(part, "bf16")
+        ckpt = {"C": "官方 FP8", "D": "官方 FP8", "E": "官方 FP8（E5 用 bf16，只做启动检查）"}.get(
+            part, "bf16"
+        )
         lines += [
             f"| {label} | {BASES[PART_BASE[part]]}，HEAD {', '.join(heads) or '-'} | {ckpt} |"
         ]
     lines += [
         "",
-        "启动参数（各部分相同，C、D 换成 FP8 checkpoint，D 去掉 --disable-overlap-schedule，"
+        "启动参数（各部分相同，C、D、E 换成 FP8 checkpoint，D、E 去掉 --disable-overlap-schedule，"
         f"A1 另加 {' '.join(COOKBOOK_PARSERS)}）：",
         "",
         "```bash",
@@ -800,7 +828,7 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
             f"{c5['median'] - GPQA_BF16_MEDIAN:+.4f}，和模型卡 {s2.GPQA_PUBLISHED} 差 {c5['delta']:+.4f}。"
             "seed 只用来区分 5 次运行：服务端不使用请求里的 seed，重跑同一个 seed 不会复现。",
         ]
-    vs = [(s, r.get(s, {}).get("vs")) for s in ("B2", "C4", "D2")]
+    vs = [(s, r.get(s, {}).get("vs")) for s in ("B2", "C4", "D2", "E2")]
     vs = [(s, v) for s, v in vs if v]
     if vs:
         lines += [
@@ -816,7 +844,9 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
             for s, v in vs
         ]
 
-    launches = [(s, r[s]) for s in ("A1", "B1", "C3", "D1", "D5") if "load_summary" in r.get(s, {})]
+    launches = [
+        (s, r[s]) for s in ("A1", "B1", "C3", "D1", "E1", "E5") if "load_summary" in r.get(s, {})
+    ]
     if launches:
         lines += [
             "",
@@ -832,12 +862,18 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
                 f"| {s} | {c['status']} | {summary} | {table.split('] ')[-1]} | "
                 f"{c.get('kv_tokens', '-')} |"
             ]
-        c3, d1 = r.get("C3", {}).get("kv_tokens"), r.get("D1", {}).get("kv_tokens")
-        if c3 and d1:
-            lines += [
-                "",
-                f"KV 池 D1 比 C3 少 {c3 - d1} 个 token，这就是 n-gram 表在 HBM 里占掉的部分。",
-            ]
+        kv = {st: r.get(st, {}).get("kv_tokens") for st in ("C3", "D1", "E1")}
+        for before, after, why in (
+            ("C3", "D1", "n-gram 表在 HBM 里占掉的部分"),
+            ("D1", "E1", "共享专家权重每设备一份多占的部分"),
+        ):
+            if kv[before] and kv[after]:
+                d = kv[before] - kv[after]
+                lines += [
+                    "",
+                    f"KV 池 {after} 比 {before} {'少' if d >= 0 else '多'} {abs(d)} 个 token，"
+                    f"预期这是{why}。",
+                ]
 
     lines += ["", "## 3. 结论（脚本按目标自动判定）", ""]
     lines += conclusions(r)
@@ -856,7 +892,7 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
         lines += [f"- {s} 问题：{p}" for p in c.get("problems", [])]
         lines += [f"- {s}：{c[k]}" for k in ("error", "reason") if k in c]
         lines += [f"- {s} 性能测量出错：{e}" for e in c.get("perf_errors", [])]
-    for s in PARTS["D"]:
+    for s in (*PARTS["D"], *PARTS["E"]):
         tail = r.get(s, {}).get("log_tail")
         if tail:
             lines += ["", f"{s} 失败时服务日志的最后 {len(tail)} 行：", "", "```text", *tail, "```"]
@@ -891,7 +927,7 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
             lines += ["", "写进工作区的改动：", "", "```diff", diff.read_text().rstrip(), "```"]
     if r.get("C1", {}).get("missing_tokens"):
         lines += ["", f"C1 没调出条目的 token 数：{r['C1']['missing_tokens']}"]
-    for s in ("A5", "B4", "D4"):
+    for s in ("A5", "B4", "D4", "E4"):
         if r.get(s, {}).get("profile"):
             lines += [f"- {s} profile：{r[s]['profile']}"]
     c7 = r.get("C7", {})
@@ -909,7 +945,7 @@ def write_report(run: rb.Run, args, repo: dict) -> Path:
 
 def conclusions(r: dict) -> list[str]:
     lines = []
-    for stage, part in (("C6", "C"), ("D3", "D")):
+    for stage, part in (("C6", "C"), ("D3", "D"), ("E3", "E")):
         m = bench_of(r, stage, VLLM_BENCH) or {}
         if "output_throughput" not in m:
             lines += [f"- 吞吐（{PART_LABEL[part]}）：{stage} 没有 vLLM 负载的数字。"]
@@ -920,7 +956,7 @@ def conclusions(r: dict) -> list[str]:
             f"- 吞吐（{PART_LABEL[part]}）：vLLM 负载下输出 {x:.1f} tok/s，是 vLLM "
             f"{VLLM_OUTPUT_THROUGHPUT} tok/s 的 {x / VLLM_OUTPUT_THROUGHPUT:.0%}，{verdict}追平目标。"
         ]
-    for stage in ("C4", "D2"):
+    for stage in ("C4", "D2", "E2"):
         m = r.get(stage, {}).get("mmlu", {})
         if "score" in m:
             verdict = "达到" if m["score"] > s2.MMLU_PASS else "没达到"
@@ -934,7 +970,11 @@ def conclusions(r: dict) -> list[str]:
             f"{verdict} ±{GPQA_TOLERANCE} 以内。"
         ]
     noise = "（100 题、准确率 0.9 左右时，两次运行之差的标准差约 0.04）"
-    for this, ref, what in (("B2", "A3", "稠密分支"), ("D2", "C4", "表在 HBM + overlap")):
+    for this, ref, what in (
+        ("B2", "A3", "稠密分支"),
+        ("D2", "C4", "表在 HBM + overlap"),
+        ("E2", "D2", "GDN 投影重排 + 共享专家每设备一份"),
+    ):
         a, b = r.get(ref, {}).get("mmlu", {}), r.get(this, {}).get("mmlu", {})
         if "score" in a and "score" in b:
             lines += [f"- {what}：{this} − {ref} = {b['score'] - a['score']:+.2f}{noise}。"]
@@ -944,7 +984,7 @@ def conclusions(r: dict) -> list[str]:
 def contributions(r: dict) -> list[str]:
     tput = {
         p: (bench_of(r, s, VLLM_BENCH) or {}).get("output_throughput")
-        for p, s in (("A", "A4"), ("B", "B3"), ("C", "C6"), ("D", "D3"))
+        for p, s in (("A", "A4"), ("B", "B3"), ("C", "C6"), ("D", "D3"), ("E", "E3"))
     }
     if any(tput[p] is None for p in "ABC"):
         return ["A4 / B3 / C6 有一组缺 vLLM 负载的数字，算不出占比。"]
@@ -954,10 +994,12 @@ def contributions(r: dict) -> list[str]:
     ]
     if tput["D"] is not None:
         steps += [("N-gram 表进 HBM + overlap（C → D）", "C", "D")]
+        if tput["E"] is not None:
+            steps += [("GDN 投影重排 + 共享专家每设备一份（D → E）", "D", "E")]
     last = steps[-1][2]
     a, end = tput["A"], tput[last]
     lines = [
-        " → ".join(f"{p} {tput[p]:.1f}" for p in "ABCD" if tput[p] is not None)
+        " → ".join(f"{p} {tput[p]:.1f}" for p in "ABCDE" if tput[p] is not None)
         + f" tok/s；vLLM {VLLM_OUTPUT_THROUGHPUT}。"
     ]
     if end > a:
@@ -1018,7 +1060,8 @@ def main() -> int:
             ("B1（基底 B，bf16）", args, LAUNCH),
             ("C3（基底 B，FP8）", fp8, LAUNCH),
             ("D1（基底 D，FP8，开 overlap）", fp8, LAUNCH_OVERLAP),
-            ("D5（基底 D，bf16，开 overlap）", args, LAUNCH_OVERLAP),
+            ("E1（基底 E，FP8，开 overlap）", fp8, LAUNCH_OVERLAP),
+            ("E5（基底 E，bf16，开 overlap）", args, LAUNCH_OVERLAP),
         )
         for name, a, launch in launches:
             print(f"\n# {name}\n{shlex.join(rb.server_cmd(a, 'qsa_sparse', launch))}")
